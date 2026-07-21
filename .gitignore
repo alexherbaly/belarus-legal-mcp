@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+.env
+pdf_cache/
+crawl4ai_env/

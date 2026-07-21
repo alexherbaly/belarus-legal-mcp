@@ -3,7 +3,7 @@ import io
 import hashlib
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -20,6 +20,10 @@ HEADERS = {
 
 PDF_CACHE_DIR = Path.home() / ".claude" / "mcp_servers" / "pdf_cache"
 PDF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+ILEX_CACHE_DIR = Path.home() / ".claude" / "mcp_servers" / "ilex_cache"
+ILEX_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+ILEX_CACHE_TTL_HOURS = 24
 
 CONTEXT_PARAGRAPHS = 1
 MAX_FRAGMENTS = 15
@@ -273,6 +277,94 @@ async def search_ilex(query: str, max_results: int = 10) -> list[dict]:
     return results
 
 
+def is_ilex_url(url: str) -> bool:
+    return "ilex.by" in url
+
+
+def url_to_ilex_cache_path(url: str) -> Path:
+    key = hashlib.md5(url.encode()).hexdigest()
+    return ILEX_CACHE_DIR / f"{key}.json"
+
+
+async def get_ilex_document_content(url: str) -> tuple[str, str | None]:
+    """Открывает документ ilex.by через headless Chrome, возвращает (текст, дата_редакции)."""
+    import shutil
+    import tempfile
+    from playwright.async_api import async_playwright
+
+    profile_src = CHROME_PROFILE_DIR / "Default"
+    tmp_dir = Path(tempfile.mkdtemp())
+    try:
+        shutil.copytree(
+            profile_src, tmp_dir / "Default",
+            ignore=shutil.ignore_patterns("SingletonLock", "SingletonCookie", "SingletonSocket", "lockfile"),
+        )
+        async with async_playwright() as p:
+            ctx = await p.chromium.launch_persistent_context(
+                user_data_dir=str(tmp_dir),
+                channel="chrome",
+                headless=True,
+                args=["--profile-directory=Default"],
+            )
+            page = await ctx.new_page()
+            await page.goto(url, wait_until="networkidle", timeout=30000)
+            title = await page.title()
+            content_el = await page.query_selector("#documentContent")
+            if content_el:
+                text = await content_el.inner_text()
+            else:
+                text = await page.inner_text("body")
+            await ctx.close()
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    revision_match = re.search(r'\(ред\.\s*от\s*(\d{2}\.\d{2}\.\d{4})\)', title)
+    revision = revision_match.group(1) if revision_match else None
+    return text, revision
+
+
+async def fetch_ilex_pages(url: str, bypass_cache: bool = False) -> tuple[list[str] | str, str]:
+    """
+    Возвращает (список страниц | строка с ошибкой, статус кеша) для документа ilex.by.
+    Кеш валиден ILEX_CACHE_TTL_HOURS часов (у ilex нет открытого API для дешёвой проверки актуальности).
+    """
+    cache_path = url_to_ilex_cache_path(url)
+
+    if cache_path.exists() and not bypass_cache:
+        data = json.loads(cache_path.read_text(encoding="utf-8"))
+        cached_at = datetime.fromisoformat(data["cached_at"])
+        if datetime.now() - cached_at < timedelta(hours=ILEX_CACHE_TTL_HOURS):
+            return [data["text"]], "cached"
+
+    try:
+        text, revision = await get_ilex_document_content(url)
+    except Exception as e:
+        return f"Ошибка загрузки документа: {e}", "error"
+
+    if not text.strip():
+        return "Документ загружен, но текст пуст.", "error"
+
+    was_updated = cache_path.exists()
+    cache_path.write_text(json.dumps({
+        "url": url,
+        "text": text,
+        "revision": revision,
+        "cached_at": datetime.now().isoformat(),
+    }, ensure_ascii=False), encoding="utf-8")
+
+    return [text], "updated" if was_updated else "downloaded"
+
+
+def ilex_cache_status_note(status: str) -> str:
+    if status == "cached":
+        return f"_[из кеша, проверено менее {ILEX_CACHE_TTL_HOURS}ч назад]_\n\n"
+    if status == "downloaded":
+        return "_[загружено впервые]_\n\n"
+    if status == "updated":
+        return "_[кеш истёк (>24ч) — документ перезагружен]_\n\n"
+    return ""
+
+
 async def fetch_authenticated_page(url: str) -> str:
     """Скачивает страницу через реальный Chrome с профилем пользователя (headless)."""
     import shutil
@@ -295,7 +387,8 @@ async def fetch_authenticated_page(url: str) -> str:
             )
             page = await ctx.new_page()
             await page.goto(url, wait_until="networkidle", timeout=30000)
-            text = await page.inner_text("body")
+            content_el = await page.query_selector("#documentContent") if is_ilex_url(url) else None
+            text = await content_el.inner_text() if content_el else await page.inner_text("body")
             await ctx.close()
         return text
     finally:
@@ -348,6 +441,25 @@ async def list_tools() -> list[types.Tool]:
             }
         ),
         types.Tool(
+            name="search_ilex_document",
+            description=(
+                "Открывает документ ilex.by по ссылке и возвращает только фрагменты, релевантные "
+                "поисковому запросу. Используй вместо crawl_authenticated когда нужен ответ на "
+                "конкретный вопрос по документу — экономит контекст в 10-20 раз. "
+                "Текст кешируется на 24 часа (bypass_cache для принудительного обновления)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "URL документа на ilex.by (view-document/...)"},
+                    "query": {"type": "string", "description": "Поисковый запрос — что именно найти в документе"},
+                    "max_results": {"type": "integer", "description": "Максимум фрагментов в ответе (по умолчанию 15)", "default": 15},
+                    "bypass_cache": {"type": "boolean", "description": "Принудительно перезагрузить документ, игнорируя кеш", "default": False}
+                },
+                "required": ["url", "query"]
+            }
+        ),
+        types.Tool(
             name="crawl_authenticated",
             description=(
                 "Скрапит страницу через реальный Chrome headless, используя активную сессию пользователя. "
@@ -391,6 +503,8 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         return await do_crawl(arguments)
     elif name == "search_ilex":
         return await do_search_ilex(arguments)
+    elif name == "search_ilex_document":
+        return await do_search_ilex_document(arguments)
     elif name == "crawl_authenticated":
         return await do_crawl_authenticated(arguments)
     elif name == "download_pdf":
@@ -430,6 +544,19 @@ async def do_search_ilex(arguments: dict) -> list[types.TextContent]:
             lines.append(f"   {r['snippet'][:200]}")
         lines.append("")
     return [types.TextContent(type="text", text="\n".join(lines))]
+
+
+async def do_search_ilex_document(arguments: dict) -> list[types.TextContent]:
+    url = arguments["url"]
+    query = arguments["query"]
+    max_results = arguments.get("max_results", MAX_FRAGMENTS)
+    bypass_cache = arguments.get("bypass_cache", False)
+    pages, status = await fetch_ilex_pages(url, bypass_cache)
+    if isinstance(pages, str):
+        return [types.TextContent(type="text", text=pages)]
+    note = ilex_cache_status_note(status)
+    result = search_in_pages(pages, query, max_results=max_results)
+    return [types.TextContent(type="text", text=note + result)]
 
 
 async def do_crawl_authenticated(arguments: dict) -> list[types.TextContent]:

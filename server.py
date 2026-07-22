@@ -181,27 +181,50 @@ def search_in_pages(pages: list[str], query: str, context: int = CONTEXT_PARAGRA
 
     idf = {kw: math.log((total_paragraphs + 1) / (doc_freq[kw] + 1)) + 1 for kw in keyword_set}
 
-    scored = []
+    matches = []  # (score, page_num, para_index)
     for page_num, (paragraphs, para_tokens_list) in enumerate(pages_paragraphs, 1):
         for i, tokens in enumerate(para_tokens_list):
             matched = keyword_set & set(tokens)
             if not matched:
                 continue
-            score = sum(idf[kw] for kw in matched)
-            start = max(0, i - context)
-            end = min(len(paragraphs), i + context + 1)
-            fragment = "\n\n".join(paragraphs[start:end])
-            scored.append((score, page_num, fragment))
+            matches.append((sum(idf[kw] for kw in matched), page_num, i))
 
-    if not scored:
+    if not matches:
         return f"По запросу «{query}» ничего не найдено в документе."
 
-    scored.sort(key=lambda x: -x[0])
-    top = scored[:max_results]
-    top.sort(key=lambda x: x[1])
+    matches.sort(key=lambda x: -x[0])
+    top = matches[:max_results]
 
-    header = f"Найдено совпадений: {len(scored)}, показано топ {len(top)} по релевантности\n\n---\n\n"
-    parts = [f"**[Стр. {page_num}]**\n{fragment}" for _, page_num, fragment in top]
+    # Строим контекстные диапазоны и объединяем пересекающиеся/смежные в пределах страницы —
+    # иначе соседние совпадения (частое дело в документах-перечнях) дублируют общий текст
+    # в двух-трёх отдельных фрагментах вместо одного.
+    ranges_by_page: dict[int, list[tuple[int, int]]] = {}
+    for _, page_num, i in top:
+        paragraphs = pages_paragraphs[page_num - 1][0]
+        start, end = max(0, i - context), min(len(paragraphs), i + context + 1)
+        ranges_by_page.setdefault(page_num, []).append((start, end))
+
+    blocks = []
+    for page_num, ranges in ranges_by_page.items():
+        ranges.sort()
+        merged: list[list[int]] = []
+        for start, end in ranges:
+            if merged and start <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], end)
+            else:
+                merged.append([start, end])
+        paragraphs = pages_paragraphs[page_num - 1][0]
+        for start, end in merged:
+            blocks.append((page_num, start, "\n\n".join(paragraphs[start:end])))
+
+    blocks.sort(key=lambda x: (x[0], x[1]))
+
+    multi_page = len({b[0] for b in blocks}) > 1
+    header = f"Найдено совпадений: {len(matches)}, показано {len(blocks)} релевантных фрагментов (из топ {len(top)})\n\n---\n\n"
+    if multi_page:
+        parts = [f"**[Стр. {page_num}]**\n{fragment}" for page_num, _, fragment in blocks]
+    else:
+        parts = [fragment for _, _, fragment in blocks]
     return header + "\n\n---\n\n".join(parts)
 
 

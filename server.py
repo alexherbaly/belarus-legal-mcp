@@ -301,6 +301,13 @@ async def search_ilex(query: str, max_results: int = 10) -> list[dict]:
             await page.goto("https://ilex-private.ilex.by/home", wait_until="networkidle", timeout=30000)
 
             inp = await page.query_selector("input.search-input")
+            if inp is None:
+                await ctx.close()
+                raise RuntimeError(
+                    "Поле поиска не найдено на странице ilex.by — вероятно, сессия не авторизована "
+                    "(нужно войти в ilex.by в Chrome под тем же профилем) либо страница не успела "
+                    "загрузиться."
+                )
             await inp.click()
             await inp.fill(query)
             await page.wait_for_timeout(1500)
@@ -592,7 +599,13 @@ async def list_tools() -> list[types.Tool]:
                 "Ищет документы на ilex.by по текстовому запросу. "
                 "Возвращает список найденных документов с заголовками и ссылками. "
                 "Используй когда нужно найти НПА или статью по теме, а прямой ссылки нет. "
-                "После получения результатов открывай нужный документ через crawl_authenticated."
+                "Запросы формулируй короткими и по теме («исчисление среднего заработка»), "
+                "а не длинными формальными реквизитами акта («постановление Минтруда №47 "
+                "об исчислении среднего заработка») — поиск ilex смысловой/полнотекстовый "
+                "и на длинные запросы с номером постановления и органом часто не находит ничего, "
+                "хотя тот же смысл коротким запросом находится сразу. "
+                "После получения результатов читай нужный документ через search_ilex_document "
+                "(точечный вопрос) или crawl_authenticated (весь текст целиком)."
             ),
             inputSchema={
                 "type": "object",

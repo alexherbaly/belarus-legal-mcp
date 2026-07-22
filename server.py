@@ -2,6 +2,7 @@ import asyncio
 import io
 import hashlib
 import json
+import math
 import re
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -150,25 +151,48 @@ def tokenize(text: str) -> list[str]:
     return [normalize(w) for w in words if len(w) > 2]
 
 
-def score_fragment(para_tokens: list[str], keywords: list[str]) -> int:
-    para_set = set(para_tokens)
-    return sum(1 for kw in keywords if kw in para_set)
-
-
 def search_in_pages(pages: list[str], query: str, context: int = CONTEXT_PARAGRAPHS, max_results: int = MAX_FRAGMENTS) -> str:
-    keywords = tokenize(query)
-    scored = []
+    """
+    Ищет абзацы, релевантные запросу, с IDF-взвешиванием: слова, встречающиеся
+    в большинстве абзацев документа (частые, неспецифичные — «труда», «журналы»
+    в кадровом НПА), получают меньший вес, чем редкие/специфичные слова.
+    Без этого в больших многотемных документах общие разделы систематически
+    вытесняют из топа релевантный, но менее «многословный» раздел.
+    """
+    keyword_set = set(tokenize(query))
+    if not keyword_set:
+        return "Пустой запрос."
 
-    for page_num, page_text in enumerate(pages, 1):
+    pages_paragraphs = []
+    total_paragraphs = 0
+    doc_freq = {kw: 0 for kw in keyword_set}
+    for page_text in pages:
         paragraphs = [p.strip() for p in re.split(r'\n{2,}', page_text) if p.strip()]
         para_tokens_list = [tokenize(p) for p in paragraphs]
-        for i, para in enumerate(paragraphs):
-            score = score_fragment(para_tokens_list[i], keywords)
-            if score > 0:
-                start = max(0, i - context)
-                end = min(len(paragraphs), i + context + 1)
-                fragment = "\n\n".join(paragraphs[start:end])
-                scored.append((score, page_num, fragment))
+        pages_paragraphs.append((paragraphs, para_tokens_list))
+        total_paragraphs += len(paragraphs)
+        for tokens in para_tokens_list:
+            token_set = set(tokens)
+            for kw in keyword_set:
+                if kw in token_set:
+                    doc_freq[kw] += 1
+
+    if total_paragraphs == 0:
+        return "Документ пуст."
+
+    idf = {kw: math.log((total_paragraphs + 1) / (doc_freq[kw] + 1)) + 1 for kw in keyword_set}
+
+    scored = []
+    for page_num, (paragraphs, para_tokens_list) in enumerate(pages_paragraphs, 1):
+        for i, tokens in enumerate(para_tokens_list):
+            matched = keyword_set & set(tokens)
+            if not matched:
+                continue
+            score = sum(idf[kw] for kw in matched)
+            start = max(0, i - context)
+            end = min(len(paragraphs), i + context + 1)
+            fragment = "\n\n".join(paragraphs[start:end])
+            scored.append((score, page_num, fragment))
 
     if not scored:
         return f"По запросу «{query}» ничего не найдено в документе."
@@ -286,8 +310,35 @@ def url_to_ilex_cache_path(url: str) -> Path:
     return ILEX_CACHE_DIR / f"{key}.json"
 
 
+def rtf_to_plain_text(rtf_path: Path) -> str:
+    """
+    Конвертирует RTF в текст. На macOS использует встроенный textutil — он даёт
+    полный и корректно структурированный текст. Библиотека striprtf (кросс-платформенный
+    фолбэк) на больших документах с таблицами теряет значительную часть содержимого.
+    """
+    import platform
+    import subprocess
+
+    if platform.system() == "Darwin":
+        result = subprocess.run(
+            ["textutil", "-convert", "txt", "-stdout", str(rtf_path)],
+            capture_output=True, timeout=60,
+        )
+        if result.returncode == 0:
+            return result.stdout.decode("utf-8", errors="ignore")
+
+    from striprtf.striprtf import rtf_to_text
+    raw = rtf_path.read_text(encoding="utf-8", errors="ignore")
+    return rtf_to_text(raw)
+
+
 async def get_ilex_document_content(url: str) -> tuple[str, str | None]:
-    """Открывает документ ilex.by через headless Chrome, возвращает (текст, дата_редакции)."""
+    """
+    Открывает документ ilex.by через headless Chrome и возвращает (текст, дата_редакции).
+    Использует кнопку «Экспорт в Word» вместо чтения текста из DOM: у ilex большие документы
+    рендерятся с виртуальным скроллом (в DOM всегда только видимая часть), поэтому прямое
+    чтение #documentContent обрезает документ до нескольких первых экранов.
+    """
     import shutil
     import tempfile
     from playwright.async_api import async_playwright
@@ -305,16 +356,25 @@ async def get_ilex_document_content(url: str) -> tuple[str, str | None]:
                 channel="chrome",
                 headless=True,
                 args=["--profile-directory=Default"],
+                accept_downloads=True,
             )
             page = await ctx.new_page()
             await page.goto(url, wait_until="networkidle", timeout=30000)
             title = await page.title()
-            content_el = await page.query_selector("#documentContent")
-            if content_el:
-                text = await content_el.inner_text()
+
+            export_btn = await page.query_selector(".export-word-button")
+            if export_btn:
+                async with page.expect_download(timeout=30000) as download_info:
+                    await export_btn.click()
+                download = await download_info.value
+                rtf_path = tmp_dir / "export.rtf"
+                await download.save_as(rtf_path)
+                await ctx.close()
+                text = rtf_to_plain_text(rtf_path)
             else:
-                text = await page.inner_text("body")
-            await ctx.close()
+                content_el = await page.query_selector("#documentContent")
+                text = await content_el.inner_text() if content_el else await page.inner_text("body")
+                await ctx.close()
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 

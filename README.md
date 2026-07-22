@@ -23,7 +23,7 @@ MCP-сервер для Claude Desktop, который добавляет инс
 ```bash
 # 1. Создать окружение
 python3 -m venv ~/.claude/mcp_servers/crawl4ai_env
-~/.claude/mcp_servers/crawl4ai_env/bin/pip install crawl4ai mcp pypdf httpx pymorphy3 playwright
+~/.claude/mcp_servers/crawl4ai_env/bin/pip install crawl4ai mcp pypdf httpx pymorphy3 playwright striprtf
 ~/.claude/mcp_servers/crawl4ai_env/bin/playwright install chromium
 
 # 2. Скопировать сервер
@@ -47,7 +47,7 @@ cp server.py ~/.claude/mcp_servers/crawl4ai_server.py
 
 ```cmd
 python -m venv %USERPROFILE%\.claude\mcp_servers\crawl4ai_env
-%USERPROFILE%\.claude\mcp_servers\crawl4ai_env\Scripts\pip install crawl4ai mcp pypdf httpx pymorphy3 playwright
+%USERPROFILE%\.claude\mcp_servers\crawl4ai_env\Scripts\pip install crawl4ai mcp pypdf httpx pymorphy3 playwright striprtf
 %USERPROFILE%\.claude\mcp_servers\crawl4ai_env\Scripts\playwright install chromium
 ```
 
@@ -131,8 +131,24 @@ mcp__crawl4ai__search_ilex_document (или mcp__crawl4ai__crawl_authenticated,
 если нужен весь текст целиком).
 ```
 
+## Как это устроено: ilex.by и виртуальный скроллинг
+
+Большие документы на ilex.by рендерятся с виртуальным скроллом — в DOM браузера
+всегда присутствует только видимая на экране часть, остальное подгружается и
+выгружается по мере прокрутки. Из-за этого прямое чтение текста со страницы
+(`page.inner_text()`) обрезает документ до нескольких первых экранов — для
+документа на 1200+ пунктов можно получить лишь ~100 из них.
+
+Решение: сервер кликает по кнопке «Экспорт в Word» на странице документа,
+перехватывает скачивание получившегося `.rtf`-файла и конвертирует его в текст.
+Это даёт полный документ вместо обрезанного фрагмента. На macOS конвертация
+идёт через встроенный `textutil`; на других платформах — через библиотеку
+`striprtf` (даёт менее точный результат на документах с крупными таблицами).
+
 ## Требования
 
 - Python 3.10+
-- Google Chrome (установленный, для `crawl_authenticated` и `search_ilex`)
+- Google Chrome (установленный, для `crawl_authenticated`, `search_ilex` и `search_ilex_document`)
 - Подписка на ilex.by с активной сессией в Chrome (для ilex-инструментов)
+- macOS — для наиболее точного извлечения текста документов ilex.by (`textutil`);
+  на других ОС используется библиотека `striprtf` (`pip install striprtf`)

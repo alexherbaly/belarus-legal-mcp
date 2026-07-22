@@ -4,7 +4,7 @@ import hashlib
 import json
 import math
 import re
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -24,7 +24,6 @@ PDF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 ILEX_CACHE_DIR = Path.home() / ".claude" / "mcp_servers" / "ilex_cache"
 ILEX_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-ILEX_CACHE_TTL_HOURS = 24
 
 CONTEXT_PARAGRAPHS = 1
 MAX_FRAGMENTS = 15
@@ -310,6 +309,48 @@ def url_to_ilex_cache_path(url: str) -> Path:
     return ILEX_CACHE_DIR / f"{key}.json"
 
 
+def extract_ilex_revision(title: str) -> str | None:
+    match = re.search(r'\(ред\.\s*от\s*(\d{2}\.\d{2}\.\d{4})\)', title)
+    return match.group(1) if match else None
+
+
+async def get_ilex_title(url: str) -> str:
+    """
+    Быстро получает title страницы документа ilex.by (без клика по экспорту в Word) —
+    используется только для проверки актуальности редакции перед решением, брать ли кеш.
+    """
+    import shutil
+    import tempfile
+    from playwright.async_api import async_playwright
+
+    profile_src = CHROME_PROFILE_DIR / "Default"
+    tmp_dir = Path(tempfile.mkdtemp())
+    try:
+        shutil.copytree(
+            profile_src, tmp_dir / "Default",
+            ignore=shutil.ignore_patterns("SingletonLock", "SingletonCookie", "SingletonSocket", "lockfile"),
+        )
+        async with async_playwright() as p:
+            ctx = await p.chromium.launch_persistent_context(
+                user_data_dir=str(tmp_dir),
+                channel="chrome",
+                headless=True,
+                args=["--profile-directory=Default"],
+            )
+            page = await ctx.new_page()
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            title = ""
+            for _ in range(10):
+                title = await page.title()
+                if title:
+                    break
+                await page.wait_for_timeout(300)
+            await ctx.close()
+        return title
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 def rtf_to_plain_text(rtf_path: Path) -> str:
     """
     Конвертирует RTF в текст. На macOS использует встроенный textutil — он даёт
@@ -378,22 +419,31 @@ async def get_ilex_document_content(url: str) -> tuple[str, str | None]:
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    revision_match = re.search(r'\(ред\.\s*от\s*(\d{2}\.\d{2}\.\d{4})\)', title)
-    revision = revision_match.group(1) if revision_match else None
+    revision = extract_ilex_revision(title)
     return text, revision
 
 
 async def fetch_ilex_pages(url: str, bypass_cache: bool = False) -> tuple[list[str] | str, str]:
     """
     Возвращает (список страниц | строка с ошибкой, статус кеша) для документа ilex.by.
-    Кеш валиден ILEX_CACHE_TTL_HOURS часов (у ilex нет открытого API для дешёвой проверки актуальности).
+    Перед использованием кеша проверяет актуальность через дату редакции в title страницы
+    (лёгкая загрузка без клика по экспорту — быстрее полного скачивания в разы). Если у
+    документа нет даты редакции в title (не все типы документов на ilex её содержат) —
+    кеш считается доверенным без проверки, аналогично поведению для pravo.by без карточки.
     """
     cache_path = url_to_ilex_cache_path(url)
 
     if cache_path.exists() and not bypass_cache:
         data = json.loads(cache_path.read_text(encoding="utf-8"))
-        cached_at = datetime.fromisoformat(data["cached_at"])
-        if datetime.now() - cached_at < timedelta(hours=ILEX_CACHE_TTL_HOURS):
+        cached_revision = data.get("revision")
+        current_revision = None
+        try:
+            current_revision = extract_ilex_revision(await get_ilex_title(url))
+        except Exception:
+            pass
+        if current_revision and current_revision != cached_revision:
+            bypass_cache = True
+        else:
             return [data["text"]], "cached"
 
     try:
@@ -417,11 +467,11 @@ async def fetch_ilex_pages(url: str, bypass_cache: bool = False) -> tuple[list[s
 
 def ilex_cache_status_note(status: str) -> str:
     if status == "cached":
-        return f"_[из кеша, проверено менее {ILEX_CACHE_TTL_HOURS}ч назад]_\n\n"
+        return "_[из кеша, редакция актуальна]_\n\n"
     if status == "downloaded":
         return "_[загружено впервые]_\n\n"
     if status == "updated":
-        return "_[кеш истёк (>24ч) — документ перезагружен]_\n\n"
+        return "_[⚠️ обнаружена новая редакция — кеш обновлён]_\n\n"
     return ""
 
 
@@ -506,7 +556,8 @@ async def list_tools() -> list[types.Tool]:
                 "Открывает документ ilex.by по ссылке и возвращает только фрагменты, релевантные "
                 "поисковому запросу. Используй вместо crawl_authenticated когда нужен ответ на "
                 "конкретный вопрос по документу — экономит контекст в 10-20 раз. "
-                "Текст кешируется на 24 часа (bypass_cache для принудительного обновления). "
+                "Текст кешируется на диск; актуальность редакции проверяется автоматически при "
+                "каждом обращении (bypass_cache для принудительного обновления). "
                 "Внутри инструмент скачивает документ через кнопку «Экспорт в Word» на странице "
                 "ilex.by и конвертирует RTF в текст — это происходит на стороне сервера и не "
                 "требует от тебя никаких действий с файлами, но гарантирует полный текст документа "

@@ -574,7 +574,7 @@ async def get_ilex_document_content(url: str) -> tuple[str, str | None]:
 
             export_btn = await page.query_selector(".export-word-button")
             if export_btn:
-                async with page.expect_download(timeout=30000) as download_info:
+                async with page.expect_download(timeout=90000) as download_info:
                     await export_btn.click()
                 download = await download_info.value
                 rtf_path = tmp_dir / "export.rtf"

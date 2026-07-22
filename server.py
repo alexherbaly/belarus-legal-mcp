@@ -27,6 +27,7 @@ ILEX_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 CONTEXT_PARAGRAPHS = 1
 MAX_FRAGMENTS = 15
+MAX_PARAGRAPH_CHARS = 2000
 
 try:
     import pymorphy3 as _pymorphy3
@@ -171,7 +172,20 @@ def split_paragraphs(text: str) -> list[str]:
     строки в чистые пустые перед разбиением.
     """
     normalized = re.sub(r'(?:\n[ \t ​ ]*)+\n', '\n\n', text)
-    return [p.strip() for p in re.split(r'\n{2,}', normalized) if p.strip()]
+    paragraphs = [p.strip() for p in re.split(r'\n{2,}', normalized) if p.strip()]
+
+    # Markdown крупных консолидированных текстов на pravo.by (весь кодекс на одной
+    # странице) вообще не содержит пустых строк между пунктами — там, где предыдущая
+    # нормализация не помогает, абзац схлопывается в весь документ целиком (мегабайты).
+    # Для таких аномально длинных «абзацев» дробим дополнительно по одинарному переносу
+    # строки — иначе один фрагмент результата фактически равен всему документу.
+    result = []
+    for p in paragraphs:
+        if len(p) > MAX_PARAGRAPH_CHARS:
+            result.extend(line.strip() for line in p.split("\n") if line.strip())
+        else:
+            result.append(p)
+    return result
 
 
 def search_in_pages(pages: list[str], query: str, context: int = CONTEXT_PARAGRAPHS, max_results: int = MAX_FRAGMENTS) -> str:
@@ -696,6 +710,26 @@ async def list_tools() -> list[types.Tool]:
             }
         ),
         types.Tool(
+            name="search_crawl",
+            description=(
+                "Скрапит веб-страницу и возвращает только фрагменты, релевантные поисковому запросу. "
+                "Используй вместо crawl когда нужен ответ на конкретный вопрос, а не вся страница целиком — "
+                "экономит контекст в 10-20 раз. Обязательно используй вместо crawl, если известно или ожидается, "
+                "что страница объёмная (например, карточка pravo.by с полным текстом кодекса прямо на странице) — "
+                "иначе результат может превысить лимит размера ответа инструмента."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "URL страницы для скрапинга"},
+                    "query": {"type": "string", "description": "Поисковый запрос — что именно найти на странице"},
+                    "max_results": {"type": "integer", "description": "Максимум фрагментов в ответе (по умолчанию 15)", "default": 15},
+                    "bypass_cache": {"type": "boolean", "default": False}
+                },
+                "required": ["url", "query"]
+            }
+        ),
+        types.Tool(
             name="download_pdf",
             description="Скачивает PDF по URL и возвращает его текстовое содержимое. Кешируется; для pravo.by автоматически проверяет актуальность редакции.",
             inputSchema={
@@ -799,6 +833,8 @@ async def list_tools() -> list[types.Tool]:
 async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
     if name == "crawl":
         return await do_crawl(arguments)
+    elif name == "search_crawl":
+        return await do_search_crawl(arguments)
     elif name == "search_ilex":
         return await do_search_ilex(arguments)
     elif name == "search_ilex_document":
@@ -823,6 +859,22 @@ async def do_crawl(arguments: dict) -> list[types.TextContent]:
     if not result.success:
         return [types.TextContent(type="text", text=f"Ошибка: {result.error_message}")]
     return [types.TextContent(type="text", text=result.markdown or "(пустая страница)")]
+
+
+async def do_search_crawl(arguments: dict) -> list[types.TextContent]:
+    url = arguments["url"]
+    query = arguments["query"]
+    max_results = arguments.get("max_results", MAX_FRAGMENTS)
+    bypass_cache = arguments.get("bypass_cache", False)
+    config = CrawlerRunConfig(
+        cache_mode=CacheMode.BYPASS if bypass_cache else CacheMode.ENABLED
+    )
+    async with AsyncWebCrawler() as crawler:
+        result = await crawler.arun(url=url, config=config)
+    if not result.success:
+        return [types.TextContent(type="text", text=f"Ошибка: {result.error_message}")]
+    pages = [result.markdown or ""]
+    return [types.TextContent(type="text", text=search_in_pages(pages, query, max_results=max_results))]
 
 
 async def do_search_ilex(arguments: dict) -> list[types.TextContent]:

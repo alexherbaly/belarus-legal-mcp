@@ -146,8 +146,32 @@ async def fetch_pdf_pages(url: str, referer: str, bypass_cache: bool = False) ->
 
 
 def tokenize(text: str) -> list[str]:
-    words = re.findall(r'[а-яёa-z]+', text.lower())
-    return [normalize(w) for w in words if len(w) > 2]
+    """
+    Числа (номера статей, пунктов) выделяются отдельными токенами без морфологической
+    нормализации — без этого запрос вида «статья 169» терял «169» полностью, оставляя
+    только общее слово «статья», которое ничего не отличает от любого другого места
+    в документе.
+    """
+    raw_tokens = re.findall(r'[а-яёa-z]+|\d+', text.lower())
+    tokens = []
+    for t in raw_tokens:
+        if t.isdigit():
+            tokens.append(t)
+        elif len(t) > 2:
+            tokens.append(normalize(t))
+    return tokens
+
+
+def split_paragraphs(text: str) -> list[str]:
+    """
+    RTF→текст экспорт ilex.by (через textutil) иногда вставляет невидимые пробельные
+    символы (hair space   и подобные) на пустых строках между абзацами. Из-за этого
+    буквальный \n{2,} не находит границу абзаца, и целые документы схлопываются в один
+    гигантский «абзац» — поиск и релевантность по нему бессмысленны. Нормализуем такие
+    строки в чистые пустые перед разбиением.
+    """
+    normalized = re.sub(r'(?:\n[ \t ​ ]*)+\n', '\n\n', text)
+    return [p.strip() for p in re.split(r'\n{2,}', normalized) if p.strip()]
 
 
 def search_in_pages(pages: list[str], query: str, context: int = CONTEXT_PARAGRAPHS, max_results: int = MAX_FRAGMENTS) -> str:
@@ -166,7 +190,7 @@ def search_in_pages(pages: list[str], query: str, context: int = CONTEXT_PARAGRA
     total_paragraphs = 0
     doc_freq = {kw: 0 for kw in keyword_set}
     for page_text in pages:
-        paragraphs = [p.strip() for p in re.split(r'\n{2,}', page_text) if p.strip()]
+        paragraphs = split_paragraphs(page_text)
         para_tokens_list = [tokenize(p) for p in paragraphs]
         pages_paragraphs.append((paragraphs, para_tokens_list))
         total_paragraphs += len(paragraphs)

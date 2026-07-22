@@ -500,6 +500,13 @@ def ilex_cache_status_note(status: str) -> str:
 
 async def fetch_authenticated_page(url: str) -> str:
     """Скачивает страницу через реальный Chrome с профилем пользователя (headless)."""
+    if is_ilex_url(url):
+        # Документы ilex.by рендерятся с виртуальным скроллом — прямое чтение DOM обрезает
+        # большие документы до нескольких первых экранов. get_ilex_document_content уже решает
+        # это через экспорт в Word (см. поиск проблемы у search_ilex_document).
+        text, _ = await get_ilex_document_content(url)
+        return text
+
     import shutil
     import tempfile
     from playwright.async_api import async_playwright
@@ -520,8 +527,7 @@ async def fetch_authenticated_page(url: str) -> str:
             )
             page = await ctx.new_page()
             await page.goto(url, wait_until="networkidle", timeout=30000)
-            content_el = await page.query_selector("#documentContent") if is_ilex_url(url) else None
-            text = await content_el.inner_text() if content_el else await page.inner_text("body")
+            text = await page.inner_text("body")
             await ctx.close()
         return text
     finally:
@@ -602,7 +608,9 @@ async def list_tools() -> list[types.Tool]:
             description=(
                 "Скрапит страницу через реальный Chrome headless, используя активную сессию пользователя. "
                 "Используй для ilex.by и других сайтов где требуется авторизация. "
-                "Chrome открываться не будет — работает в фоне."
+                "Chrome открываться не будет — работает в фоне. Для документов ilex.by автоматически "
+                "использует тот же механизм получения полного текста (экспорт в Word), что и "
+                "search_ilex_document, но без поиска фрагментов — возвращает весь текст целиком."
             ),
             inputSchema={
                 "type": "object",

@@ -266,7 +266,13 @@ CHROME_PROFILE_DIR = Path.home() / "Library" / "Application Support" / "Google" 
 
 
 async def search_ilex(query: str, max_results: int = 10) -> list[dict]:
-    """Ищет документы на ilex.by через поисковую строку. Возвращает список {title, url, snippet}."""
+    """
+    Ищет документы на ilex.by через поисковую строку.
+
+    Помимо обычной выдачи search/extended ilex показывает тематические блоки
+    (например, таблицу «Избежание двойного налогообложения»). Их строки приходят
+    отдельным запросом classifier/content и поэтому раньше были невидимы MCP.
+    """
     import shutil
     import tempfile
     from playwright.async_api import async_playwright
@@ -288,12 +294,31 @@ async def search_ilex(query: str, max_results: int = 10) -> list[dict]:
             )
             page = await ctx.new_page()
 
-            # Перехватываем ответ search/extended
+            # Перехватываем как обычную выдачу, так и тематические классификаторы.
             search_data = {}
+            extended_loaded = asyncio.Event()
+            smart_entities_loaded = asyncio.Event()
+            classifier_loaded = asyncio.Event()
+            classifier_expected = False
+
             async def capture(response):
-                if "search/extended" in response.url or "search/autocomplete" in response.url:
+                nonlocal classifier_expected
+                if any(endpoint in response.url for endpoint in (
+                    "search/extended", "search/autocomplete", "search/smart-entities",
+                    "classifier/content"
+                )):
                     try:
-                        search_data[response.url] = await response.json()
+                        data = await response.json()
+                        search_data[response.url] = data
+                        if "search/extended" in response.url:
+                            extended_loaded.set()
+                        elif "search/smart-entities" in response.url:
+                            classifier_expected = bool(
+                                isinstance(data, dict) and data.get("classifierBlockModel")
+                            )
+                            smart_entities_loaded.set()
+                        elif "classifier/content" in response.url:
+                            classifier_loaded.set()
                     except Exception:
                         pass
             page.on("response", capture)
@@ -319,20 +344,45 @@ async def search_ilex(query: str, max_results: int = 10) -> list[dict]:
                 await inp.press("Enter")
 
             await page.wait_for_load_state("networkidle", timeout=15000)
-            await page.wait_for_timeout(1000)
+            # Обычная и тематическая выдачи загружаются независимо. Ждём фактические
+            # API-ответы вместо фиксированной паузы, чтобы не пропустить более медленный
+            # classifier/content и не замедлять запросы без тематического блока.
+            for event, timeout in ((extended_loaded, 5), (smart_entities_loaded, 5)):
+                try:
+                    await asyncio.wait_for(event.wait(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    pass
+            if classifier_expected and not classifier_loaded.is_set():
+                try:
+                    await asyncio.wait_for(classifier_loaded.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    pass
 
-            # Парсим результаты из перехваченного API
+            # Тематический классификатор содержит более точные прямые ссылки на НПА,
+            # поэтому ставим его результаты перед полнотекстовой выдачей.
+            for url, data in search_data.items():
+                if "classifier/content" in url and isinstance(data, dict):
+                    results.extend(parse_ilex_classifier_results(data, max_results))
+
+            # Парсим обычные результаты из перехваченного API.
             for url, data in search_data.items():
                 if "search/extended" in url and isinstance(data, dict):
                     hits = data.get("hits", [])
-                    for hit in hits[:max_results]:
+                    for hit in hits:
                         infobank = hit.get("infoBank", {}).get("value", "")
                         num = hit.get("numberInInfoBank")
                         name = hit.get("name", "").replace("<em>", "").replace("</em>", "")
                         snippet = hit.get("snippet", "").replace("<em>", "").replace("</em>", "")
                         if infobank and num:
                             doc_url = f"https://ilex-private.ilex.by/view-document/{infobank}/{num}/"
-                            results.append({"title": name, "url": doc_url, "snippet": snippet})
+                            add_unique_ilex_result(results, {
+                                "title": name,
+                                "url": doc_url,
+                                "snippet": snippet,
+                                "source": "обычная выдача",
+                            }, max_results)
+                        if len(results) >= max_results:
+                            break
                     break
 
             # Fallback: парсим ссылки со страницы
@@ -345,12 +395,77 @@ async def search_ilex(query: str, max_results: int = 10) -> list[dict]:
                     if href and href not in seen:
                         seen.add(href)
                         full = href if href.startswith("http") else f"https://ilex-private.ilex.by{href}"
-                        results.append({"title": text[:120], "url": full, "snippet": ""})
+                        add_unique_ilex_result(results, {
+                            "title": text[:120],
+                            "url": full,
+                            "snippet": "",
+                            "source": "страница результатов",
+                        }, max_results)
 
             await ctx.close()
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
+    return results
+
+
+def parse_ilex_classifier_link(value: str) -> tuple[str, int, str | None] | None:
+    """Разбирает внутреннюю ссылку ilex вида Б=BELAW_Д=13142_М=100012."""
+    match = re.search(r"Б=([^_]+)_Д=(\d+)(?:_М=(\d+))?", value or "")
+    if not match:
+        return None
+    return match.group(1), int(match.group(2)), match.group(3)
+
+
+def canonical_ilex_document_url(url: str) -> str:
+    """Убирает поисковый хвост и якорь, чтобы дедуплицировать один документ."""
+    match = re.search(r"(https?://[^/]+/view-document/[^/]+/\d+/)", url)
+    return match.group(1) if match else url.split("#", 1)[0].split("?", 1)[0]
+
+
+def add_unique_ilex_result(results: list[dict], result: dict, max_results: int) -> None:
+    if len(results) >= max_results:
+        return
+    canonical = canonical_ilex_document_url(result["url"])
+    if any(canonical_ilex_document_url(item["url"]) == canonical for item in results):
+        return
+    results.append(result)
+
+
+def parse_ilex_classifier_results(data: dict, max_results: int = 10) -> list[dict]:
+    """Преобразует строки тематической таблицы ilex в уникальные документы."""
+    grouped: dict[tuple[str, int], dict] = {}
+    for row in data.get("content", []):
+        if not isinstance(row, dict):
+            continue
+        document_ref = parse_ilex_classifier_link(row.get("link_0", ""))
+        if document_ref is None:
+            continue
+        infobank, number, segment = document_ref
+        key = (infobank, number)
+        item = grouped.setdefault(key, {
+            "title": str(row.get("0", "")).strip(),
+            "url": (
+                f"https://ilex-private.ilex.by/view-document/{infobank}/{number}/"
+                + (f"#M{segment}" if segment else "")
+            ),
+            "snippets": [],
+        })
+        details = [str(row.get(column, "")).strip() for column in ("1", "2", "3")]
+        snippet = " — ".join(value for value in details if value)
+        if snippet and snippet not in item["snippets"]:
+            item["snippets"].append(snippet)
+
+    results = []
+    for item in grouped.values():
+        results.append({
+            "title": item["title"],
+            "url": item["url"],
+            "snippet": "; ".join(item["snippets"]),
+            "source": "тематический классификатор ilex",
+        })
+        if len(results) >= max_results:
+            break
     return results
 
 
@@ -723,6 +838,8 @@ async def do_search_ilex(arguments: dict) -> list[types.TextContent]:
     for i, r in enumerate(results, 1):
         lines.append(f"**{i}. {r['title']}**")
         lines.append(f"   {r['url']}")
+        if r.get("source"):
+            lines.append(f"   Источник результата: {r['source']}")
         if r["snippet"]:
             lines.append(f"   {r['snippet'][:200]}")
         lines.append("")

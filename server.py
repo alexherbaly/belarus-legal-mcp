@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import re
+from bisect import bisect_right
 from datetime import datetime
 from pathlib import Path
 from mcp.server import Server
@@ -26,8 +27,9 @@ ILEX_CACHE_DIR = Path.home() / ".claude" / "mcp_servers" / "ilex_cache"
 ILEX_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 CONTEXT_PARAGRAPHS = 1
-MAX_FRAGMENTS = 15
+MAX_FRAGMENTS = 5
 MAX_PARAGRAPH_CHARS = 2000
+MAX_RESPONSE_CHARS = 12000
 
 try:
     import pymorphy3 as _pymorphy3
@@ -188,7 +190,13 @@ def split_paragraphs(text: str) -> list[str]:
     return result
 
 
-def search_in_pages(pages: list[str], query: str, context: int = CONTEXT_PARAGRAPHS, max_results: int = MAX_FRAGMENTS) -> str:
+def search_in_pages(
+    pages: list[str],
+    query: str,
+    context: int = CONTEXT_PARAGRAPHS,
+    max_results: int = MAX_FRAGMENTS,
+    max_chars: int = MAX_RESPONSE_CHARS,
+) -> str:
     """
     Ищет абзацы, релевантные запросу, с IDF-взвешиванием: слова, встречающиеся
     в большинстве абзацев документа (частые, неспецифичные — «труда», «журналы»
@@ -236,34 +244,289 @@ def search_in_pages(pages: list[str], query: str, context: int = CONTEXT_PARAGRA
     # Строим контекстные диапазоны и объединяем пересекающиеся/смежные в пределах страницы —
     # иначе соседние совпадения (частое дело в документах-перечнях) дублируют общий текст
     # в двух-трёх отдельных фрагментах вместо одного.
-    ranges_by_page: dict[int, list[tuple[int, int]]] = {}
-    for _, page_num, i in top:
+    ranges_by_page: dict[int, list[tuple[int, int, float]]] = {}
+    for score, page_num, i in top:
         paragraphs = pages_paragraphs[page_num - 1][0]
         start, end = max(0, i - context), min(len(paragraphs), i + context + 1)
-        ranges_by_page.setdefault(page_num, []).append((start, end))
+        ranges_by_page.setdefault(page_num, []).append((start, end, score))
 
     blocks = []
     for page_num, ranges in ranges_by_page.items():
         ranges.sort()
-        merged: list[list[int]] = []
-        for start, end in ranges:
+        merged: list[list[float | int]] = []
+        for start, end, score in ranges:
             if merged and start <= merged[-1][1]:
                 merged[-1][1] = max(merged[-1][1], end)
+                merged[-1][2] = max(merged[-1][2], score)
             else:
-                merged.append([start, end])
+                merged.append([start, end, score])
         paragraphs = pages_paragraphs[page_num - 1][0]
-        for start, end in merged:
-            blocks.append((page_num, start, "\n\n".join(paragraphs[start:end])))
+        for start, end, score in merged:
+            blocks.append((score, page_num, start, "\n\n".join(paragraphs[start:end])))
 
-    blocks.sort(key=lambda x: (x[0], x[1]))
+    # Сначала отбираем наиболее релевантные блоки в пределах общего бюджета ответа.
+    # Первый блок всегда возвращается целиком: обрезать норму посередине опаснее, чем
+    # однократно превысить мягкий лимит. Остальные блоки можно запросить отдельно.
+    ranked_blocks = sorted(blocks, key=lambda x: (-x[0], x[1], x[2]))
+    selected = []
+    selected_chars = 0
+    omitted_by_budget = 0
+    for block in ranked_blocks:
+        block_chars = len(block[3])
+        if selected and max_chars > 0 and selected_chars + block_chars > max_chars:
+            omitted_by_budget += 1
+            continue
+        selected.append(block)
+        selected_chars += block_chars
 
-    multi_page = len({b[0] for b in blocks}) > 1
-    header = f"Найдено совпадений: {len(matches)}, показано {len(blocks)} релевантных фрагментов (из топ {len(top)})\n\n---\n\n"
+    selected.sort(key=lambda x: (x[1], x[2]))
+
+    multi_page = len({b[1] for b in selected}) > 1
+    budget_note = (
+        f", пропущено по лимиту размера: {omitted_by_budget}"
+        if omitted_by_budget else ""
+    )
+    header = (
+        f"Найдено совпадений: {len(matches)}, показано {len(selected)} "
+        f"релевантных фрагментов (из топ {len(top)}){budget_note}\n\n---\n\n"
+    )
     if multi_page:
-        parts = [f"**[Стр. {page_num}]**\n{fragment}" for page_num, _, fragment in blocks]
+        parts = [
+            f"**[Стр. {page_num}]**\n{fragment}"
+            for _, page_num, _, fragment in selected
+        ]
     else:
-        parts = [fragment for _, _, fragment in blocks]
+        parts = [fragment for _, _, _, fragment in selected]
     return header + "\n\n---\n\n".join(parts)
+
+
+_DASHES = "‐‑‒–—−"
+_ARTICLE_HEADING_RE = re.compile(
+    rf"(?im)^[ \t]*статья[ \t]+(\d+(?:[-{_DASHES}]\d+)?)(?=[ \t]*(?:\.|$))"
+)
+_POINT_HEADING_RE = re.compile(
+    r"(?m)^[ \t]*(\d+(?:\.\d+)*)\.(?=[ \t]+)"
+)
+_EXPLICIT_LOCATOR_RE = re.compile(
+    rf"(?i)\b(ст(?:ать(?:я|и|ю|е|ёй|ей)|\.)|пункт(?:а|у|е|ом)?)"
+    rf"\s+(\d+(?:[-{_DASHES}.]\d+)*)"
+)
+
+
+def normalize_section_id(value: str) -> str:
+    normalized = value.strip()
+    for dash in _DASHES:
+        normalized = normalized.replace(dash, "-")
+    return normalized.rstrip(".")
+
+
+def parse_section_locator(locator: str) -> tuple[str, str]:
+    """Возвращает (тип, номер): article, point либо auto для голого номера."""
+    value = locator.strip()
+    explicit = _EXPLICIT_LOCATOR_RE.search(value)
+    if explicit:
+        kind = "article" if explicit.group(1).lower().startswith("ст") else "point"
+        return kind, normalize_section_id(explicit.group(2))
+
+    section_id = normalize_section_id(value)
+    if not re.fullmatch(r"\d+(?:[-.]\d+)*", section_id):
+        raise ValueError(f"Не удалось распознать структурный номер: {locator}")
+    if "." in section_id:
+        return "point", section_id
+    return "auto", section_id
+
+
+def explicit_locators_from_query(query: str) -> list[str]:
+    """Извлекает только явно названные статьи/пункты, не угадывая голые числа."""
+    locators = []
+    for match in _EXPLICIT_LOCATOR_RE.finditer(query):
+        label = "статья" if match.group(1).lower().startswith("ст") else "пункт"
+        locator = f"{label} {normalize_section_id(match.group(2))}"
+        if locator not in locators:
+            locators.append(locator)
+    return locators
+
+
+def _page_offsets(pages: list[str]) -> tuple[str, list[int]]:
+    starts = []
+    parts = []
+    offset = 0
+    for page in pages:
+        starts.append(offset)
+        parts.append(page)
+        offset += len(page) + 2
+    return "\n\n".join(parts), starts
+
+
+def _section_spans(text: str, pattern: re.Pattern) -> list[tuple[str, int, int]]:
+    matches = list(pattern.finditer(text))
+    spans = []
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        spans.append((normalize_section_id(match.group(1)), match.start(), end))
+    return spans
+
+
+def _point_spans(text: str) -> list[tuple[str, int, int]]:
+    """
+    Пункт включает вложенные подпункты: 21.4 продолжается через 21.4.1 и
+    заканчивается перед 21.5 либо 22, а не перед первым дочерним номером.
+    """
+    matches = list(_POINT_HEADING_RE.finditer(text))
+    spans = []
+    for index, match in enumerate(matches):
+        section_id = normalize_section_id(match.group(1))
+        depth = section_id.count(".") + 1
+        end = len(text)
+        for next_match in matches[index + 1:]:
+            next_id = normalize_section_id(next_match.group(1))
+            next_depth = next_id.count(".") + 1
+            if next_depth <= depth:
+                end = next_match.start()
+                break
+        spans.append((section_id, match.start(), end))
+    return spans
+
+
+def _span_index(
+    spans: list[tuple[str, int, int]]
+) -> dict[str, list[tuple[int, int]]]:
+    index: dict[str, list[tuple[int, int]]] = {}
+    for section_id, start, end in spans:
+        index.setdefault(section_id, []).append((start, end))
+    return index
+
+
+def extract_structured_sections(
+    pages: list[str],
+    locators: list[str],
+    max_chars: int = MAX_RESPONSE_CHARS,
+) -> str:
+    """
+    Извлекает статьи/пункты целиком. Лимит мягкий: первая найденная норма никогда
+    не обрезается; нормы, не поместившиеся после неё, перечисляются как пропущенные.
+    """
+    if not locators:
+        return "Не указаны номера статей или пунктов."
+
+    text, page_starts = _page_offsets(pages)
+    article_spans = _section_spans(text, _ARTICLE_HEADING_RE)
+    point_spans = _point_spans(text)
+    span_maps = {
+        "article": _span_index(article_spans),
+        "point": _span_index(point_spans),
+    }
+
+    found = []
+    missing = []
+    ambiguous = []
+    invalid = []
+    seen_spans = set()
+    for locator in locators:
+        try:
+            kind, section_id = parse_section_locator(locator)
+        except ValueError:
+            invalid.append(locator)
+            continue
+
+        candidates = ("article", "point") if kind == "auto" else (kind,)
+        span = None
+        matched_kind = None
+        for candidate in candidates:
+            candidate_spans = span_maps[candidate].get(section_id, [])
+            if len(candidate_spans) > 1:
+                if candidate == "article":
+                    # В экспортированных документах ilex статья часто встречается
+                    # сначала одной строкой в оглавлении, а затем полным текстом.
+                    # Основной текст надёжно отличается самым длинным диапазоном.
+                    span = max(
+                        candidate_spans,
+                        key=lambda candidate_span: candidate_span[1] - candidate_span[0],
+                    )
+                    matched_kind = candidate
+                    break
+                ambiguous.append(locator)
+                span = None
+                matched_kind = None
+                break
+            if candidate_spans:
+                span = candidate_spans[0]
+                matched_kind = candidate
+                break
+        if locator in ambiguous:
+            continue
+        if not span:
+            missing.append(locator)
+            continue
+        if span in seen_spans:
+            continue
+        seen_spans.add(span)
+        start, end = span
+        page_num = bisect_right(page_starts, start)
+        label = "Статья" if matched_kind == "article" else "Пункт"
+        found.append({
+            "label": label,
+            "section_id": section_id,
+            "page": page_num,
+            "text": text[start:end].strip(),
+        })
+
+    selected = []
+    omitted = []
+    selected_chars = 0
+    for item in found:
+        item_chars = len(item["text"])
+        if selected and max_chars > 0 and selected_chars + item_chars > max_chars:
+            omitted.append(f"{item['label']} {item['section_id']}")
+            continue
+        selected.append(item)
+        selected_chars += item_chars
+
+    details = [f"Извлечено структурных элементов: {len(selected)}."]
+    if missing:
+        details.append("Не найдены: " + ", ".join(missing) + ".")
+    if ambiguous:
+        details.append(
+            "Неоднозначные номера, уточните статью или полный номер пункта: "
+            + ", ".join(ambiguous) + "."
+        )
+    if invalid:
+        details.append("Не распознаны: " + ", ".join(invalid) + ".")
+    if omitted:
+        details.append("Не помещены в лимит: " + ", ".join(omitted) + ".")
+
+    blocks = []
+    multi_page = len({item["page"] for item in selected}) > 1
+    for item in selected:
+        page = f", стр. {item['page']}" if multi_page else ""
+        blocks.append(
+            f"**{item['label']} {item['section_id']}{page}**\n{item['text']}"
+        )
+    if not blocks:
+        return " ".join(details)
+    return " ".join(details) + "\n\n---\n\n" + "\n\n---\n\n".join(blocks)
+
+
+def search_with_structural_preference(
+    pages: list[str],
+    query: str,
+    max_results: int = MAX_FRAGMENTS,
+    max_chars: int = MAX_RESPONSE_CHARS,
+) -> str:
+    """
+    Для явно названных статей/пунктов сначала пробует точное извлечение.
+    Если формат документа не распознан, безопасно возвращается к IDF-поиску.
+    """
+    locators = explicit_locators_from_query(query)
+    if locators:
+        structured = extract_structured_sections(
+            pages, locators, max_chars=max_chars
+        )
+        if not structured.startswith("Извлечено структурных элементов: 0."):
+            return structured
+    return search_in_pages(
+        pages, query, max_results=max_results, max_chars=max_chars
+    )
 
 
 def cache_status_note(status: str) -> str:
@@ -723,7 +986,8 @@ async def list_tools() -> list[types.Tool]:
                 "properties": {
                     "url": {"type": "string", "description": "URL страницы для скрапинга"},
                     "query": {"type": "string", "description": "Поисковый запрос — что именно найти на странице"},
-                    "max_results": {"type": "integer", "description": "Максимум фрагментов в ответе (по умолчанию 15)", "default": 15},
+                    "max_results": {"type": "integer", "description": "Максимум фрагментов в ответе (по умолчанию 5)", "default": 5},
+                    "max_chars": {"type": "integer", "description": "Мягкий лимит размера ответа в символах (по умолчанию 12000)", "default": 12000},
                     "bypass_cache": {"type": "boolean", "default": False}
                 },
                 "required": ["url", "query"]
@@ -783,10 +1047,34 @@ async def list_tools() -> list[types.Tool]:
                 "properties": {
                     "url": {"type": "string", "description": "URL документа на ilex.by (view-document/...)"},
                     "query": {"type": "string", "description": "Поисковый запрос — что именно найти в документе"},
-                    "max_results": {"type": "integer", "description": "Максимум фрагментов в ответе (по умолчанию 15)", "default": 15},
+                    "max_results": {"type": "integer", "description": "Максимум фрагментов в ответе (по умолчанию 5)", "default": 5},
+                    "max_chars": {"type": "integer", "description": "Мягкий лимит размера ответа в символах (по умолчанию 12000)", "default": 12000},
                     "bypass_cache": {"type": "boolean", "description": "Принудительно перезагрузить документ, игнорируя кеш", "default": False}
                 },
                 "required": ["url", "query"]
+            }
+        ),
+        types.Tool(
+            name="get_ilex_sections",
+            description=(
+                "Возвращает точный полный текст указанных статей или пунктов документа ilex.by. "
+                "Используй вместо тематического поиска, когда номера структурных элементов известны. "
+                "Можно получить несколько норм одного документа одним вызовом; реквизиты кеша и "
+                "редакции выводятся один раз."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "URL документа ilex.by"},
+                    "sections": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Например: ['статья 18', 'статья 261-3', 'пункт 21.4']"
+                    },
+                    "max_chars": {"type": "integer", "description": "Мягкий лимит размера ответа в символах (по умолчанию 12000)", "default": 12000},
+                    "bypass_cache": {"type": "boolean", "default": False}
+                },
+                "required": ["url", "sections"]
             }
         ),
         types.Tool(
@@ -820,10 +1108,33 @@ async def list_tools() -> list[types.Tool]:
                     "url": {"type": "string", "description": "URL PDF-файла"},
                     "query": {"type": "string", "description": "Поисковый запрос — что именно найти в документе"},
                     "referer": {"type": "string", "description": "Referer URL (если сайт требует)"},
-                    "max_results": {"type": "integer", "description": "Максимум фрагментов в ответе (по умолчанию 15)", "default": 15},
+                    "max_results": {"type": "integer", "description": "Максимум фрагментов в ответе (по умолчанию 5)", "default": 5},
+                    "max_chars": {"type": "integer", "description": "Мягкий лимит размера ответа в символах (по умолчанию 12000)", "default": 12000},
                     "bypass_cache": {"type": "boolean", "description": "Принудительно перекачать, игнорируя кеш", "default": False}
                 },
                 "required": ["url", "query"]
+            }
+        ),
+        types.Tool(
+            name="get_pdf_sections",
+            description=(
+                "Возвращает точный полный текст указанных статей или пунктов PDF. "
+                "Используй вместо тематического поиска, когда номера структурных элементов известны."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "URL PDF-файла"},
+                    "sections": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Например: ['статья 18', 'пункт 21.4']"
+                    },
+                    "referer": {"type": "string", "description": "Referer URL (если сайт требует)"},
+                    "max_chars": {"type": "integer", "description": "Мягкий лимит размера ответа в символах (по умолчанию 12000)", "default": 12000},
+                    "bypass_cache": {"type": "boolean", "default": False}
+                },
+                "required": ["url", "sections"]
             }
         )
     ]
@@ -839,12 +1150,16 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         return await do_search_ilex(arguments)
     elif name == "search_ilex_document":
         return await do_search_ilex_document(arguments)
+    elif name == "get_ilex_sections":
+        return await do_get_ilex_sections(arguments)
     elif name == "crawl_authenticated":
         return await do_crawl_authenticated(arguments)
     elif name == "download_pdf":
         return await do_download_pdf(arguments)
     elif name == "search_pdf":
         return await do_search_pdf(arguments)
+    elif name == "get_pdf_sections":
+        return await do_get_pdf_sections(arguments)
     raise ValueError(f"Unknown tool: {name}")
 
 
@@ -865,6 +1180,7 @@ async def do_search_crawl(arguments: dict) -> list[types.TextContent]:
     url = arguments["url"]
     query = arguments["query"]
     max_results = arguments.get("max_results", MAX_FRAGMENTS)
+    max_chars = arguments.get("max_chars", MAX_RESPONSE_CHARS)
     bypass_cache = arguments.get("bypass_cache", False)
     config = CrawlerRunConfig(
         cache_mode=CacheMode.BYPASS if bypass_cache else CacheMode.ENABLED
@@ -874,7 +1190,10 @@ async def do_search_crawl(arguments: dict) -> list[types.TextContent]:
     if not result.success:
         return [types.TextContent(type="text", text=f"Ошибка: {result.error_message}")]
     pages = [result.markdown or ""]
-    return [types.TextContent(type="text", text=search_in_pages(pages, query, max_results=max_results))]
+    text = search_with_structural_preference(
+        pages, query, max_results=max_results, max_chars=max_chars
+    )
+    return [types.TextContent(type="text", text=text)]
 
 
 async def do_search_ilex(arguments: dict) -> list[types.TextContent]:
@@ -902,12 +1221,28 @@ async def do_search_ilex_document(arguments: dict) -> list[types.TextContent]:
     url = arguments["url"]
     query = arguments["query"]
     max_results = arguments.get("max_results", MAX_FRAGMENTS)
+    max_chars = arguments.get("max_chars", MAX_RESPONSE_CHARS)
     bypass_cache = arguments.get("bypass_cache", False)
     pages, status = await fetch_ilex_pages(url, bypass_cache)
     if isinstance(pages, str):
         return [types.TextContent(type="text", text=pages)]
     note = ilex_cache_status_note(status)
-    result = search_in_pages(pages, query, max_results=max_results)
+    result = search_with_structural_preference(
+        pages, query, max_results=max_results, max_chars=max_chars
+    )
+    return [types.TextContent(type="text", text=note + result)]
+
+
+async def do_get_ilex_sections(arguments: dict) -> list[types.TextContent]:
+    url = arguments["url"]
+    sections = arguments["sections"]
+    max_chars = arguments.get("max_chars", MAX_RESPONSE_CHARS)
+    bypass_cache = arguments.get("bypass_cache", False)
+    pages, status = await fetch_ilex_pages(url, bypass_cache)
+    if isinstance(pages, str):
+        return [types.TextContent(type="text", text=pages)]
+    note = ilex_cache_status_note(status)
+    result = extract_structured_sections(pages, sections, max_chars=max_chars)
     return [types.TextContent(type="text", text=note + result)]
 
 
@@ -937,12 +1272,29 @@ async def do_search_pdf(arguments: dict) -> list[types.TextContent]:
     query = arguments["query"]
     referer = arguments.get("referer", url)
     max_results = arguments.get("max_results", MAX_FRAGMENTS)
+    max_chars = arguments.get("max_chars", MAX_RESPONSE_CHARS)
     bypass_cache = arguments.get("bypass_cache", False)
     pages, status = await fetch_pdf_pages(url, referer, bypass_cache)
     if isinstance(pages, str):
         return [types.TextContent(type="text", text=pages)]
     note = cache_status_note(status)
-    result = search_in_pages(pages, query, max_results=max_results)
+    result = search_with_structural_preference(
+        pages, query, max_results=max_results, max_chars=max_chars
+    )
+    return [types.TextContent(type="text", text=note + result)]
+
+
+async def do_get_pdf_sections(arguments: dict) -> list[types.TextContent]:
+    url = arguments["url"]
+    sections = arguments["sections"]
+    referer = arguments.get("referer", url)
+    max_chars = arguments.get("max_chars", MAX_RESPONSE_CHARS)
+    bypass_cache = arguments.get("bypass_cache", False)
+    pages, status = await fetch_pdf_pages(url, referer, bypass_cache)
+    if isinstance(pages, str):
+        return [types.TextContent(type="text", text=pages)]
+    note = cache_status_note(status)
+    result = extract_structured_sections(pages, sections, max_chars=max_chars)
     return [types.TextContent(type="text", text=note + result)]
 
 

@@ -141,6 +141,10 @@ async def fetch_pdf_pages(url: str, referer: str, bypass_cache: bool = False) ->
     cache_path.write_text(json.dumps({
         "url": url,
         "pages": pages,
+        # Индекс хранит только границы структурных элементов. При следующем
+        # запросе статьи/пункта не нужно снова прогонять весь документ через
+        # регулярные выражения.
+        "structure_index": build_structural_index(pages),
         "cached_at": datetime.now().isoformat(),
         "last_revision": last_revision,
     }, ensure_ascii=False), encoding="utf-8")
@@ -397,10 +401,39 @@ def _span_index(
     return index
 
 
+def build_structural_index(pages: list[str]) -> dict:
+    """Строит компактный, JSON-совместимый индекс статей и пунктов документа."""
+    text, page_starts = _page_offsets(pages)
+    return {
+        "page_starts": page_starts,
+        "article": _span_index(_section_spans(text, _ARTICLE_HEADING_RE)),
+        "point": _span_index(_point_spans(text)),
+    }
+
+
+def cached_structural_index(cache_path: Path, pages: list[str]) -> dict:
+    """Берёт индекс из кеша, а старый кеш однократно дополняет им."""
+    try:
+        data = json.loads(cache_path.read_text(encoding="utf-8"))
+        index = data.get("structure_index")
+        if index:
+            return index
+        index = build_structural_index(pages)
+        data["structure_index"] = index
+        cache_path.write_text(
+            json.dumps(data, ensure_ascii=False), encoding="utf-8"
+        )
+        return index
+    except (OSError, json.JSONDecodeError):
+        # Невозможность обновить кеш не должна мешать чтению нормы.
+        return build_structural_index(pages)
+
+
 def extract_structured_sections(
     pages: list[str],
     locators: list[str],
     max_chars: int = MAX_RESPONSE_CHARS,
+    structure_index: dict | None = None,
 ) -> str:
     """
     Извлекает статьи/пункты целиком. Лимит мягкий: первая найденная норма никогда
@@ -409,12 +442,13 @@ def extract_structured_sections(
     if not locators:
         return "Не указаны номера статей или пунктов."
 
-    text, page_starts = _page_offsets(pages)
-    article_spans = _section_spans(text, _ARTICLE_HEADING_RE)
-    point_spans = _point_spans(text)
+    text, computed_page_starts = _page_offsets(pages)
+    structure_index = structure_index or build_structural_index(pages)
+    # JSON превращает кортежи в списки; для алгоритма это безразлично.
+    page_starts = structure_index.get("page_starts", computed_page_starts)
     span_maps = {
-        "article": _span_index(article_spans),
-        "point": _span_index(point_spans),
+        "article": structure_index.get("article", {}),
+        "point": structure_index.get("point", {}),
     }
 
     found = []
@@ -443,6 +477,7 @@ def extract_structured_sections(
                         candidate_spans,
                         key=lambda candidate_span: candidate_span[1] - candidate_span[0],
                     )
+                    span = tuple(span)
                     matched_kind = candidate
                     break
                 ambiguous.append(locator)
@@ -450,7 +485,7 @@ def extract_structured_sections(
                 matched_kind = None
                 break
             if candidate_spans:
-                span = candidate_spans[0]
+                span = tuple(candidate_spans[0])
                 matched_kind = candidate
                 break
         if locator in ambiguous:
@@ -904,6 +939,7 @@ async def fetch_ilex_pages(url: str, bypass_cache: bool = False) -> tuple[list[s
     cache_path.write_text(json.dumps({
         "url": url,
         "text": text,
+        "structure_index": build_structural_index([text]),
         "revision": revision,
         "cached_at": datetime.now().isoformat(),
     }, ensure_ascii=False), encoding="utf-8")
@@ -1242,7 +1278,10 @@ async def do_get_ilex_sections(arguments: dict) -> list[types.TextContent]:
     if isinstance(pages, str):
         return [types.TextContent(type="text", text=pages)]
     note = ilex_cache_status_note(status)
-    result = extract_structured_sections(pages, sections, max_chars=max_chars)
+    index = cached_structural_index(url_to_ilex_cache_path(url), pages)
+    result = extract_structured_sections(
+        pages, sections, max_chars=max_chars, structure_index=index
+    )
     return [types.TextContent(type="text", text=note + result)]
 
 
@@ -1294,7 +1333,10 @@ async def do_get_pdf_sections(arguments: dict) -> list[types.TextContent]:
     if isinstance(pages, str):
         return [types.TextContent(type="text", text=pages)]
     note = cache_status_note(status)
-    result = extract_structured_sections(pages, sections, max_chars=max_chars)
+    index = cached_structural_index(url_to_cache_path(url), pages)
+    result = extract_structured_sections(
+        pages, sections, max_chars=max_chars, structure_index=index
+    )
     return [types.TextContent(type="text", text=note + result)]
 
 

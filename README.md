@@ -26,7 +26,7 @@ MCP-сервер для Claude Desktop, который добавляет инс
 ```bash
 # 1. Создать окружение
 python3 -m venv ~/.claude/mcp_servers/crawl4ai_env
-~/.claude/mcp_servers/crawl4ai_env/bin/pip install crawl4ai mcp pypdf httpx pymorphy3 playwright striprtf
+~/.claude/mcp_servers/crawl4ai_env/bin/pip install .
 ~/.claude/mcp_servers/crawl4ai_env/bin/playwright install chromium
 
 # 2. Скопировать сервер
@@ -50,7 +50,7 @@ cp server.py ~/.claude/mcp_servers/crawl4ai_server.py
 
 ```cmd
 python -m venv %USERPROFILE%\.claude\mcp_servers\crawl4ai_env
-%USERPROFILE%\.claude\mcp_servers\crawl4ai_env\Scripts\pip install crawl4ai mcp pypdf httpx pymorphy3 playwright striprtf
+%USERPROFILE%\.claude\mcp_servers\crawl4ai_env\Scripts\pip install .
 %USERPROFILE%\.claude\mcp_servers\crawl4ai_env\Scripts\playwright install chromium
 ```
 
@@ -68,6 +68,13 @@ python -m venv %USERPROFILE%\.claude\mcp_servers\crawl4ai_env
 ```
 
 > Замените `ИМЯ` на ваше имя пользователя.
+
+Команды `pip install .` нужно выполнять из папки этого проекта. Для проверки
+изменений запустите:
+
+```bash
+python -m unittest discover -s tests -v
+```
 
 Перезапустить Claude Desktop.
 

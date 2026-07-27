@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "belarus-legal-mcp"
+version = "0.1.0"
+description = "MCP-сервер для точечного поиска в первичных текстах законодательства Беларуси"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "crawl4ai>=0.5",
+    "httpx>=0.27",
+    "mcp>=1.0",
+    "playwright>=1.40",
+    "pymorphy3>=2.0",
+    "pypdf>=4.0",
+    "striprtf>=0.0.26",
+]
+
+[tool.setuptools]
+py-modules = ["server"]

@@ -3,6 +3,7 @@ import unittest
 from server import (
     MAX_FRAGMENTS,
     MAX_RESPONSE_CHARS,
+    build_structural_index,
     explicit_locators_from_query,
     extract_structured_sections,
     search_in_pages,
@@ -169,6 +170,18 @@ class StructuredRetrievalTests(unittest.TestCase):
 
         self.assertIn("К компетенции общего собрания", result)
         self.assertIn("Полный текст статьи продолжается", result)
+
+    def test_uses_prebuilt_structural_index(self):
+        index = build_structural_index(SAMPLE_DOCUMENT)
+
+        result = extract_structured_sections(
+            SAMPLE_DOCUMENT,
+            ["статья 18", "пункт 21.4"],
+            structure_index=index,
+        )
+
+        self.assertIn("Трудовой договор заключается", result)
+        self.assertIn("Документы о переносе отпуска", result)
 
 
 if __name__ == "__main__":

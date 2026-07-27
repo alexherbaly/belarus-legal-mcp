@@ -1,10 +1,14 @@
 import asyncio
+import contextvars
 import io
 import hashlib
 import json
 import math
 import re
+import time
+import uuid
 from bisect import bisect_right
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from mcp.server import Server
@@ -26,10 +30,50 @@ PDF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 ILEX_CACHE_DIR = Path.home() / ".claude" / "mcp_servers" / "ilex_cache"
 ILEX_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
+PERF_LOG_PATH = (
+    Path.home() / ".claude" / "mcp_servers" / "logs" / "belarus_legal_mcp.jsonl"
+)
+PERF_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+
 CONTEXT_PARAGRAPHS = 1
 MAX_FRAGMENTS = 5
 MAX_PARAGRAPH_CHARS = 2000
 MAX_RESPONSE_CHARS = 12000
+
+_PERF_CALL_ID = contextvars.ContextVar("perf_call_id", default=None)
+_PERF_TOOL_NAME = contextvars.ContextVar("perf_tool_name", default=None)
+_last_tool_finished_at: float | None = None
+
+
+def log_perf(event: str, **fields) -> None:
+    """Пишет машинно-читаемые замеры, не загрязняя stdout протокола MCP."""
+    record = {
+        "timestamp": datetime.now().isoformat(),
+        "event": event,
+        "call_id": _PERF_CALL_ID.get(),
+        "tool": _PERF_TOOL_NAME.get(),
+        **fields,
+    }
+    try:
+        with PERF_LOG_PATH.open("a", encoding="utf-8") as log_file:
+            log_file.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError:
+        # Диагностика не должна мешать юридическому поиску.
+        pass
+
+
+@contextmanager
+def perf_stage(stage: str):
+    """Измеряет синхронный или async-этап внутри текущего вызова инструмента."""
+    started_at = time.perf_counter()
+    try:
+        yield
+    finally:
+        log_perf(
+            "stage",
+            stage=stage,
+            duration_ms=round((time.perf_counter() - started_at) * 1000, 2),
+        )
 
 try:
     import pymorphy3 as _pymorphy3
@@ -80,12 +124,14 @@ def get_card_url_from_pdf_url(pdf_url: str) -> str | None:
 async def fetch_pdf_pages(url: str, referer: str, bypass_cache: bool = False) -> tuple[list[str] | str, str]:
     """
     Скачивает PDF и возвращает (список страниц | строку с ошибкой, статус кеша).
-    Статус кеша: 'cached', 'downloaded', 'updated', 'error'
+    Статус кеша: 'cached', 'downloaded', 'updated', 'refreshed', 'error'
     """
     import httpx
     from pypdf import PdfReader
 
     cache_path = url_to_cache_path(url)
+    forced_refresh = bypass_cache
+    revision_changed = False
 
     # Если кеш есть и не форсируем — проверяем актуальность для pravo.by
     if cache_path.exists() and not bypass_cache:
@@ -99,6 +145,7 @@ async def fetch_pdf_pages(url: str, referer: str, bypass_cache: bool = False) ->
                 if latest_revision and latest_revision != cached_revision:
                     # Редакция изменилась — перекачиваем
                     bypass_cache = True
+                    revision_changed = True
                     data["old_revision"] = cached_revision
                     data["new_revision"] = latest_revision
                 else:
@@ -149,7 +196,11 @@ async def fetch_pdf_pages(url: str, referer: str, bypass_cache: bool = False) ->
         "last_revision": last_revision,
     }, ensure_ascii=False), encoding="utf-8")
 
-    return pages, "updated" if was_updated else "downloaded"
+    if not was_updated:
+        return pages, "downloaded"
+    if revision_changed:
+        return pages, "updated"
+    return pages, "refreshed" if forced_refresh else "updated"
 
 
 def tokenize(text: str) -> list[str]:
@@ -571,6 +622,8 @@ def cache_status_note(status: str) -> str:
         return "_[скачан впервые]_\n\n"
     if status == "updated":
         return "_[⚠️ обнаружена новая редакция — кеш обновлён]_\n\n"
+    if status == "refreshed":
+        return "_[кеш принудительно обновлён по запросу]_\n\n"
     return ""
 
 
@@ -593,17 +646,19 @@ async def search_ilex(query: str, max_results: int = 10) -> list[dict]:
     tmp_dir = Path(tempfile.mkdtemp())
     results = []
     try:
-        shutil.copytree(
-            profile_src, tmp_dir / "Default",
-            ignore=shutil.ignore_patterns("SingletonLock", "SingletonCookie", "SingletonSocket", "lockfile"),
-        )
-        async with async_playwright() as p:
-            ctx = await p.chromium.launch_persistent_context(
-                user_data_dir=str(tmp_dir),
-                channel="chrome",
-                headless=True,
-                args=["--profile-directory=Default"],
+        with perf_stage("chrome_profile_copy"):
+            shutil.copytree(
+                profile_src, tmp_dir / "Default",
+                ignore=shutil.ignore_patterns("SingletonLock", "SingletonCookie", "SingletonSocket", "lockfile"),
             )
+        async with async_playwright() as p:
+            with perf_stage("chrome_launch"):
+                ctx = await p.chromium.launch_persistent_context(
+                    user_data_dir=str(tmp_dir),
+                    channel="chrome",
+                    headless=True,
+                    args=["--profile-directory=Default"],
+                )
             page = await ctx.new_page()
 
             # Перехватываем как обычную выдачу, так и тематические классификаторы.
@@ -635,7 +690,12 @@ async def search_ilex(query: str, max_results: int = 10) -> list[dict]:
                         pass
             page.on("response", capture)
 
-            await page.goto("https://ilex-private.ilex.by/home", wait_until="networkidle", timeout=30000)
+            with perf_stage("ilex_home_load"):
+                await page.goto(
+                    "https://ilex-private.ilex.by/home",
+                    wait_until="networkidle",
+                    timeout=30000,
+                )
 
             inp = await page.query_selector("input.search-input")
             if inp is None:
@@ -645,30 +705,31 @@ async def search_ilex(query: str, max_results: int = 10) -> list[dict]:
                     "(нужно войти в ilex.by в Chrome под тем же профилем) либо страница не успела "
                     "загрузиться."
                 )
-            await inp.click()
-            await inp.fill(query)
-            await page.wait_for_timeout(1500)
+            with perf_stage("ilex_search_wait"):
+                await inp.click()
+                await inp.fill(query)
+                await page.wait_for_timeout(1500)
 
-            btn = await page.query_selector("button.search-button")
-            if btn:
-                await btn.click()
-            else:
-                await inp.press("Enter")
+                btn = await page.query_selector("button.search-button")
+                if btn:
+                    await btn.click()
+                else:
+                    await inp.press("Enter")
 
-            await page.wait_for_load_state("networkidle", timeout=15000)
-            # Обычная и тематическая выдачи загружаются независимо. Ждём фактические
-            # API-ответы вместо фиксированной паузы, чтобы не пропустить более медленный
-            # classifier/content и не замедлять запросы без тематического блока.
-            for event, timeout in ((extended_loaded, 5), (smart_entities_loaded, 5)):
-                try:
-                    await asyncio.wait_for(event.wait(), timeout=timeout)
-                except asyncio.TimeoutError:
-                    pass
-            if classifier_expected and not classifier_loaded.is_set():
-                try:
-                    await asyncio.wait_for(classifier_loaded.wait(), timeout=5)
-                except asyncio.TimeoutError:
-                    pass
+                await page.wait_for_load_state("networkidle", timeout=15000)
+                # Обычная и тематическая выдачи загружаются независимо. Ждём фактические
+                # API-ответы вместо фиксированной паузы, чтобы не пропустить более медленный
+                # classifier/content и не замедлять запросы без тематического блока.
+                for event, timeout in ((extended_loaded, 5), (smart_entities_loaded, 5)):
+                    try:
+                        await asyncio.wait_for(event.wait(), timeout=timeout)
+                    except asyncio.TimeoutError:
+                        pass
+                if classifier_expected and not classifier_loaded.is_set():
+                    try:
+                        await asyncio.wait_for(classifier_loaded.wait(), timeout=5)
+                    except asyncio.TimeoutError:
+                        pass
 
             # Тематический классификатор содержит более точные прямые ссылки на НПА,
             # поэтому ставим его результаты перед полнотекстовой выдачей.
@@ -807,19 +868,24 @@ async def get_ilex_title(url: str) -> str:
     profile_src = CHROME_PROFILE_DIR / "Default"
     tmp_dir = Path(tempfile.mkdtemp())
     try:
-        shutil.copytree(
-            profile_src, tmp_dir / "Default",
-            ignore=shutil.ignore_patterns("SingletonLock", "SingletonCookie", "SingletonSocket", "lockfile"),
-        )
-        async with async_playwright() as p:
-            ctx = await p.chromium.launch_persistent_context(
-                user_data_dir=str(tmp_dir),
-                channel="chrome",
-                headless=True,
-                args=["--profile-directory=Default"],
+        with perf_stage("chrome_profile_copy"):
+            shutil.copytree(
+                profile_src, tmp_dir / "Default",
+                ignore=shutil.ignore_patterns("SingletonLock", "SingletonCookie", "SingletonSocket", "lockfile"),
             )
+        async with async_playwright() as p:
+            with perf_stage("chrome_launch"):
+                ctx = await p.chromium.launch_persistent_context(
+                    user_data_dir=str(tmp_dir),
+                    channel="chrome",
+                    headless=True,
+                    args=["--profile-directory=Default"],
+                )
             page = await ctx.new_page()
-            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            with perf_stage("ilex_revision_page_load"):
+                await page.goto(
+                    url, wait_until="domcontentloaded", timeout=30000
+                )
             title = ""
             for _ in range(10):
                 title = await page.title()
@@ -868,31 +934,36 @@ async def get_ilex_document_content(url: str) -> tuple[str, str | None]:
     profile_src = CHROME_PROFILE_DIR / "Default"
     tmp_dir = Path(tempfile.mkdtemp())
     try:
-        shutil.copytree(
-            profile_src, tmp_dir / "Default",
-            ignore=shutil.ignore_patterns("SingletonLock", "SingletonCookie", "SingletonSocket", "lockfile"),
-        )
-        async with async_playwright() as p:
-            ctx = await p.chromium.launch_persistent_context(
-                user_data_dir=str(tmp_dir),
-                channel="chrome",
-                headless=True,
-                args=["--profile-directory=Default"],
-                accept_downloads=True,
+        with perf_stage("chrome_profile_copy"):
+            shutil.copytree(
+                profile_src, tmp_dir / "Default",
+                ignore=shutil.ignore_patterns("SingletonLock", "SingletonCookie", "SingletonSocket", "lockfile"),
             )
+        async with async_playwright() as p:
+            with perf_stage("chrome_launch"):
+                ctx = await p.chromium.launch_persistent_context(
+                    user_data_dir=str(tmp_dir),
+                    channel="chrome",
+                    headless=True,
+                    args=["--profile-directory=Default"],
+                    accept_downloads=True,
+                )
             page = await ctx.new_page()
-            await page.goto(url, wait_until="networkidle", timeout=30000)
+            with perf_stage("ilex_document_page_load"):
+                await page.goto(url, wait_until="networkidle", timeout=30000)
             title = await page.title()
 
             export_btn = await page.query_selector(".export-word-button")
             if export_btn:
-                async with page.expect_download(timeout=90000) as download_info:
-                    await export_btn.click()
-                download = await download_info.value
-                rtf_path = tmp_dir / "export.rtf"
-                await download.save_as(rtf_path)
+                with perf_stage("ilex_word_export_download"):
+                    async with page.expect_download(timeout=90000) as download_info:
+                        await export_btn.click()
+                    download = await download_info.value
+                    rtf_path = tmp_dir / "export.rtf"
+                    await download.save_as(rtf_path)
                 await ctx.close()
-                text = rtf_to_plain_text(rtf_path)
+                with perf_stage("rtf_to_text"):
+                    text = rtf_to_plain_text(rtf_path)
             else:
                 content_el = await page.query_selector("#documentContent")
                 text = await content_el.inner_text() if content_el else await page.inner_text("body")
@@ -913,9 +984,12 @@ async def fetch_ilex_pages(url: str, bypass_cache: bool = False) -> tuple[list[s
     кеш считается доверенным без проверки, аналогично поведению для pravo.by без карточки.
     """
     cache_path = url_to_ilex_cache_path(url)
+    forced_refresh = bypass_cache
+    revision_changed = False
 
     if cache_path.exists() and not bypass_cache:
-        data = json.loads(cache_path.read_text(encoding="utf-8"))
+        with perf_stage("ilex_cache_read"):
+            data = json.loads(cache_path.read_text(encoding="utf-8"))
         cached_revision = data.get("revision")
         current_revision = None
         try:
@@ -924,11 +998,13 @@ async def fetch_ilex_pages(url: str, bypass_cache: bool = False) -> tuple[list[s
             pass
         if current_revision and current_revision != cached_revision:
             bypass_cache = True
+            revision_changed = True
         else:
             return [data["text"]], "cached"
 
     try:
-        text, revision = await get_ilex_document_content(url)
+        with perf_stage("ilex_document_fetch_total"):
+            text, revision = await get_ilex_document_content(url)
     except Exception as e:
         return f"Ошибка загрузки документа: {e}", "error"
 
@@ -936,15 +1012,20 @@ async def fetch_ilex_pages(url: str, bypass_cache: bool = False) -> tuple[list[s
         return "Документ загружен, но текст пуст.", "error"
 
     was_updated = cache_path.exists()
-    cache_path.write_text(json.dumps({
-        "url": url,
-        "text": text,
-        "structure_index": build_structural_index([text]),
-        "revision": revision,
-        "cached_at": datetime.now().isoformat(),
-    }, ensure_ascii=False), encoding="utf-8")
+    with perf_stage("ilex_index_and_cache_write"):
+        cache_path.write_text(json.dumps({
+            "url": url,
+            "text": text,
+            "structure_index": build_structural_index([text]),
+            "revision": revision,
+            "cached_at": datetime.now().isoformat(),
+        }, ensure_ascii=False), encoding="utf-8")
 
-    return [text], "updated" if was_updated else "downloaded"
+    if not was_updated:
+        return [text], "downloaded"
+    if revision_changed:
+        return [text], "updated"
+    return [text], "refreshed" if forced_refresh else "updated"
 
 
 def ilex_cache_status_note(status: str) -> str:
@@ -954,6 +1035,8 @@ def ilex_cache_status_note(status: str) -> str:
         return "_[загружено впервые]_\n\n"
     if status == "updated":
         return "_[⚠️ обнаружена новая редакция — кеш обновлён]_\n\n"
+    if status == "refreshed":
+        return "_[кеш принудительно обновлён по запросу]_\n\n"
     return ""
 
 
@@ -1053,8 +1136,9 @@ async def list_tools() -> list[types.Tool]:
                 "об исчислении среднего заработка») — поиск ilex смысловой/полнотекстовый "
                 "и на длинные запросы с номером постановления и органом часто не находит ничего, "
                 "хотя тот же смысл коротким запросом находится сразу. "
-                "После получения результатов читай нужный документ через search_ilex_document "
-                "(точечный вопрос) или crawl_authenticated (весь текст целиком)."
+                "После получения результатов используй get_ilex_sections, если номер нормы известен; "
+                "search_ilex_document — если номер неизвестен; crawl_authenticated — только когда "
+                "действительно нужен весь текст целиком."
             ),
             inputSchema={
                 "type": "object",
@@ -1071,8 +1155,11 @@ async def list_tools() -> list[types.Tool]:
                 "Открывает документ ilex.by по ссылке и возвращает только фрагменты, релевантные "
                 "поисковому запросу. Используй вместо crawl_authenticated когда нужен ответ на "
                 "конкретный вопрос по документу — экономит контекст в 10-20 раз. "
+                "НЕ ИСПОЛЬЗУЙ этот инструмент, если номер статьи или пункта уже известен: в таком "
+                "случае обязательно вызывай get_ilex_sections, чтобы не возвращать лишние фрагменты. "
                 "Текст кешируется на диск; актуальность редакции проверяется автоматически при "
-                "каждом обращении (bypass_cache для принудительного обновления). "
+                "каждом обращении. Не устанавливай bypass_cache=true без прямой просьбы пользователя "
+                "или подтверждённого повреждения кеша: это запускает дорогой повторный экспорт документа. "
                 "Внутри инструмент скачивает документ через кнопку «Экспорт в Word» на странице "
                 "ilex.by и конвертирует RTF в текст — это происходит на стороне сервера и не "
                 "требует от тебя никаких действий с файлами, но гарантирует полный текст документа "
@@ -1085,7 +1172,7 @@ async def list_tools() -> list[types.Tool]:
                     "query": {"type": "string", "description": "Поисковый запрос — что именно найти в документе"},
                     "max_results": {"type": "integer", "description": "Максимум фрагментов в ответе (по умолчанию 5)", "default": 5},
                     "max_chars": {"type": "integer", "description": "Мягкий лимит размера ответа в символах (по умолчанию 12000)", "default": 12000},
-                    "bypass_cache": {"type": "boolean", "description": "Принудительно перезагрузить документ, игнорируя кеш", "default": False}
+                    "bypass_cache": {"type": "boolean", "description": "Аварийное принудительное обновление. Использовать только по прямой просьбе пользователя или при подтверждённой ошибке кеша", "default": False}
                 },
                 "required": ["url", "query"]
             }
@@ -1094,7 +1181,7 @@ async def list_tools() -> list[types.Tool]:
             name="get_ilex_sections",
             description=(
                 "Возвращает точный полный текст указанных статей или пунктов документа ilex.by. "
-                "Используй вместо тематического поиска, когда номера структурных элементов известны. "
+                "ВСЕГДА используй вместо search_ilex_document, когда номера структурных элементов известны. "
                 "Можно получить несколько норм одного документа одним вызовом; реквизиты кеша и "
                 "редакции выводятся один раз."
             ),
@@ -1108,7 +1195,7 @@ async def list_tools() -> list[types.Tool]:
                         "description": "Например: ['статья 18', 'статья 261-3', 'пункт 21.4']"
                     },
                     "max_chars": {"type": "integer", "description": "Мягкий лимит размера ответа в символах (по умолчанию 12000)", "default": 12000},
-                    "bypass_cache": {"type": "boolean", "default": False}
+                    "bypass_cache": {"type": "boolean", "description": "Аварийное принудительное обновление; обычно оставляй false", "default": False}
                 },
                 "required": ["url", "sections"]
             }
@@ -1134,8 +1221,10 @@ async def list_tools() -> list[types.Tool]:
             name="search_pdf",
             description=(
                 "Скачивает PDF и возвращает только фрагменты, релевантные поисковому запросу. "
-                "Используй вместо download_pdf когда нужен ответ на конкретный вопрос по документу — "
-                "экономит контекст в 10-20 раз. PDF кешируется; для pravo.by автоматически проверяет "
+                "Используй вместо download_pdf, когда нужен ответ на конкретный вопрос по документу: "
+                "это экономит контекст в 10-20 раз. "
+                "Если номер статьи или пункта известен, вместо этого используй get_pdf_sections. "
+                "PDF кешируется; для pravo.by автоматически проверяет "
                 "актуальность редакции и обновляет кеш если появилась новая версия."
             ),
             inputSchema={
@@ -1146,7 +1235,7 @@ async def list_tools() -> list[types.Tool]:
                     "referer": {"type": "string", "description": "Referer URL (если сайт требует)"},
                     "max_results": {"type": "integer", "description": "Максимум фрагментов в ответе (по умолчанию 5)", "default": 5},
                     "max_chars": {"type": "integer", "description": "Мягкий лимит размера ответа в символах (по умолчанию 12000)", "default": 12000},
-                    "bypass_cache": {"type": "boolean", "description": "Принудительно перекачать, игнорируя кеш", "default": False}
+                    "bypass_cache": {"type": "boolean", "description": "Аварийное принудительное обновление; не использовать без необходимости", "default": False}
                 },
                 "required": ["url", "query"]
             }
@@ -1176,8 +1265,7 @@ async def list_tools() -> list[types.Tool]:
     ]
 
 
-@server.call_tool()
-async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
+async def dispatch_tool(name: str, arguments: dict) -> list[types.TextContent]:
     if name == "crawl":
         return await do_crawl(arguments)
     elif name == "search_crawl":
@@ -1197,6 +1285,47 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
     elif name == "get_pdf_sections":
         return await do_get_pdf_sections(arguments)
     raise ValueError(f"Unknown tool: {name}")
+
+
+@server.call_tool()
+async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
+    global _last_tool_finished_at
+
+    call_id = uuid.uuid4().hex[:12]
+    call_token = _PERF_CALL_ID.set(call_id)
+    tool_token = _PERF_TOOL_NAME.set(name)
+    started_at = time.perf_counter()
+    since_previous_ms = (
+        round((started_at - _last_tool_finished_at) * 1000, 2)
+        if _last_tool_finished_at is not None else None
+    )
+    log_perf(
+        "tool_start",
+        since_previous_tool_ms=since_previous_ms,
+        bypass_cache=bool(arguments.get("bypass_cache", False)),
+    )
+    status = "ok"
+    response_chars = 0
+    try:
+        result = await dispatch_tool(name, arguments)
+        response_chars = sum(
+            len(item.text) for item in result if isinstance(item, types.TextContent)
+        )
+        return result
+    except Exception:
+        status = "error"
+        raise
+    finally:
+        finished_at = time.perf_counter()
+        log_perf(
+            "tool_finish",
+            status=status,
+            duration_ms=round((finished_at - started_at) * 1000, 2),
+            response_chars=response_chars,
+        )
+        _last_tool_finished_at = finished_at
+        _PERF_CALL_ID.reset(call_token)
+        _PERF_TOOL_NAME.reset(tool_token)
 
 
 async def do_crawl(arguments: dict) -> list[types.TextContent]:
@@ -1236,7 +1365,8 @@ async def do_search_ilex(arguments: dict) -> list[types.TextContent]:
     query = arguments["query"]
     max_results = arguments.get("max_results", 10)
     try:
-        results = await search_ilex(query, max_results)
+        with perf_stage("ilex_search_total"):
+            results = await search_ilex(query, max_results)
     except Exception as e:
         return [types.TextContent(type="text", text=f"Ошибка поиска: {e}")]
     if not results:
@@ -1263,9 +1393,10 @@ async def do_search_ilex_document(arguments: dict) -> list[types.TextContent]:
     if isinstance(pages, str):
         return [types.TextContent(type="text", text=pages)]
     note = ilex_cache_status_note(status)
-    result = search_with_structural_preference(
-        pages, query, max_results=max_results, max_chars=max_chars
-    )
+    with perf_stage("document_search"):
+        result = search_with_structural_preference(
+            pages, query, max_results=max_results, max_chars=max_chars
+        )
     return [types.TextContent(type="text", text=note + result)]
 
 
@@ -1278,10 +1409,11 @@ async def do_get_ilex_sections(arguments: dict) -> list[types.TextContent]:
     if isinstance(pages, str):
         return [types.TextContent(type="text", text=pages)]
     note = ilex_cache_status_note(status)
-    index = cached_structural_index(url_to_ilex_cache_path(url), pages)
-    result = extract_structured_sections(
-        pages, sections, max_chars=max_chars, structure_index=index
-    )
+    with perf_stage("section_index_read_and_extract"):
+        index = cached_structural_index(url_to_ilex_cache_path(url), pages)
+        result = extract_structured_sections(
+            pages, sections, max_chars=max_chars, structure_index=index
+        )
     return [types.TextContent(type="text", text=note + result)]
 
 

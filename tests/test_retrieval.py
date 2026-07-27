@@ -4,8 +4,10 @@ from server import (
     MAX_FRAGMENTS,
     MAX_RESPONSE_CHARS,
     build_structural_index,
+    cache_status_note,
     explicit_locators_from_query,
     extract_structured_sections,
+    ilex_cache_status_note,
     search_in_pages,
     search_with_structural_preference,
 )
@@ -55,6 +57,15 @@ class StructuredRetrievalTests(unittest.TestCase):
     def test_defaults_are_token_bounded(self):
         self.assertEqual(MAX_FRAGMENTS, 5)
         self.assertEqual(MAX_RESPONSE_CHARS, 12000)
+
+    def test_forced_refresh_is_not_reported_as_new_revision(self):
+        self.assertIn("принудительно обновлён", cache_status_note("refreshed"))
+        self.assertIn(
+            "принудительно обновлён", ilex_cache_status_note("refreshed")
+        )
+        self.assertNotIn(
+            "новая редакция", ilex_cache_status_note("refreshed")
+        )
 
     def test_extracts_multiple_articles_in_one_response(self):
         result = extract_structured_sections(

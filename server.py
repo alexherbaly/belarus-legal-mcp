@@ -49,6 +49,7 @@ MAX_RESPONSE_CHARS = 12000
 _PERF_CALL_ID = contextvars.ContextVar("perf_call_id", default=None)
 _PERF_TOOL_NAME = contextvars.ContextVar("perf_tool_name", default=None)
 _last_tool_finished_at: float | None = None
+_LEGAL_RESEARCH_EVIDENCE: dict[str, dict] = {}
 
 
 def log_perf(event: str, **fields) -> None:
@@ -963,6 +964,268 @@ def canonical_ilex_document_url(url: str) -> str:
     return match.group(1) if match else url.split("#", 1)[0].split("?", 1)[0]
 
 
+def canonical_section_locator(locator: str) -> str:
+    """Нормализует ссылку на норму для машинной проверки полноты."""
+    kind, section_id = parse_section_locator(locator)
+    if kind == "article":
+        return f"статья {section_id}"
+    if kind == "point":
+        return f"пункт {section_id}"
+    return section_id
+
+
+def _research_evidence(url: str) -> dict:
+    canonical = canonical_ilex_document_url(url)
+    return _LEGAL_RESEARCH_EVIDENCE.setdefault(canonical, {
+        "url": canonical,
+        "exact_sections": set(),
+        "document_searched": False,
+        "full_text_loaded": False,
+        "revision_checked": False,
+        "related_inspected": False,
+        "related_candidates": [],
+    })
+
+
+def record_exact_ilex_sections(
+    url: str,
+    locators: list[str],
+    result: str,
+    status: str,
+) -> None:
+    """Запоминает только нормы, которые действительно присутствуют в ответе."""
+    evidence = _research_evidence(url)
+    evidence["revision_checked"] = status in {
+        "cached", "downloaded", "updated", "refreshed"
+    }
+    for locator in locators:
+        try:
+            canonical = canonical_section_locator(locator)
+        except ValueError:
+            continue
+        kind, section_id = parse_section_locator(locator)
+        label = "Статья" if kind == "article" else "Пункт"
+        if kind == "auto":
+            pattern = rf"\*\*(?:Статья|Пункт) {re.escape(section_id)}(?:,|\*)"
+        else:
+            pattern = rf"\*\*{label} {re.escape(section_id)}(?:,|\*)"
+        if re.search(pattern, result):
+            evidence["exact_sections"].add(canonical)
+
+
+_RELATION_MARKER_RE = re.compile(
+    r"(?i)\b(?:протокол\s+к|о\s+внесении\s+изменений|"
+    r"об\s+изменении|о\s+дополнении|дополнительное\s+соглашение)\b"
+)
+_RELATION_STOPWORDS = {
+    "республика", "республики", "беларусь", "беларуси", "правительство",
+    "правительством", "соглашение", "соглашению", "между", "отношении",
+    "налогов", "налога", "доходов", "имущества", "документ", "статья",
+}
+
+
+def ilex_document_heading(text: str) -> str:
+    """Возвращает компактный заголовок из начала экспортированного документа."""
+    heading_start = re.compile(
+        r"^(?:КОНСТИТУЦИЯ|КОДЕКС|НАЛОГОВЫЙ КОДЕКС|ТРУДОВОЙ КОДЕКС|"
+        r"ЗАКОН|УКАЗ|ДЕКРЕТ|ПОСТАНОВЛЕНИЕ|РЕШЕНИЕ|СОГЛАШЕНИЕ|"
+        r"КОНВЕНЦИЯ|ДОГОВОР|ПРОТОКОЛ)\b",
+        re.IGNORECASE,
+    )
+    lines = []
+    for raw_line in text[:5000].splitlines():
+        line = re.sub(r"\s+", " ", raw_line).strip(" \t-*")
+        if not line:
+            if lines:
+                break
+            continue
+        if not lines and not heading_start.search(line):
+            continue
+        lines.append(line)
+        if len(" ".join(lines)) >= 500:
+            break
+    return " ".join(lines)[:600]
+
+
+def _distinctive_tokens(value: str) -> set[str]:
+    words = {
+        word.lower()
+        for word in re.findall(r"[А-Яа-яЁёA-Za-z]{6,}", value)
+    }
+    return words - _RELATION_STOPWORDS
+
+
+def related_document_score(base_text: str, candidate_text: str) -> float:
+    """Оценивает, является ли кандидат протоколом/изменением базового акта."""
+    candidate_head = candidate_text[:5000]
+    if not _RELATION_MARKER_RE.search(candidate_head):
+        return 0.0
+    base_tokens = _distinctive_tokens(ilex_document_heading(base_text))
+    candidate_tokens = _distinctive_tokens(candidate_head)
+    if not base_tokens:
+        return 0.0
+    return len(base_tokens & candidate_tokens) / len(base_tokens)
+
+
+def discover_related_cached_ilex_documents(
+    url: str,
+    text: str,
+    min_score: float = 0.45,
+) -> list[dict]:
+    """
+    Ищет связанные протоколы и изменяющие акты среди уже полученных BELAW.
+    Это самообучающийся индекс: никаких списков стран или номеров документов.
+    """
+    current = canonical_ilex_document_url(url)
+    candidates = []
+    for cache_path in ILEX_CACHE_DIR.glob("*.json"):
+        try:
+            data = json.loads(cache_path.read_text(encoding="utf-8"))
+            candidate_url = canonical_ilex_document_url(data.get("url", ""))
+            candidate_text = data.get("text", "")
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            continue
+        if not candidate_url or candidate_url == current or "/BELAW/" not in candidate_url:
+            continue
+        score = related_document_score(text, candidate_text)
+        if score < min_score:
+            continue
+        candidates.append({
+            "url": candidate_url,
+            "title": ilex_document_heading(candidate_text),
+            "score": round(score, 3),
+            "source": "локальный индекс ранее полученных BELAW",
+        })
+    candidates.sort(key=lambda item: (-item["score"], item["url"]))
+    return candidates
+
+
+def document_requires_related_review(text: str) -> bool:
+    """Консервативно отмечает документы, для которых отдельные акты типичны."""
+    heading = ilex_document_heading(text).lower()
+    if heading.startswith("протокол"):
+        return False
+    return any(kind in heading for kind in (
+        "соглашение", "конвенция", "договор между",
+    ))
+
+
+def extract_future_change_markers(
+    text: str,
+    current_year: int | None = None,
+) -> list[str]:
+    """Возвращает компактные маркеры явно будущих дат вступления изменений."""
+    current_year = current_year or datetime.now().year
+    markers = []
+    for raw_line in text.splitlines():
+        line = re.sub(r"\s+", " ", raw_line).strip()
+        if len(line) < 8 or not re.search(
+            r"(?i)(?:вступ\w*\s+в\s+силу|ввод\w*\s+в\s+действие|"
+            r"редакц\w*,?\s+действующ\w*\s+с|изменени\w*\s+с)",
+            line,
+        ):
+            continue
+        years = [int(year) for year in re.findall(r"\b(20\d{2})\b", line)]
+        if years and max(years) > current_year and line not in markers:
+            markers.append(line[:500])
+        if len(markers) >= 10:
+            break
+    return markers
+
+
+def ilex_document_metadata(
+    text: str,
+    revision: str | None = None,
+    current_year: int | None = None,
+) -> dict:
+    entry_force = re.search(
+        r"(?i)\bвступил[оа]?\s+в\s+силу\s+"
+        r"(\d{1,2}\s+[а-яё]+\s+\d{4}\s+года|\d{2}\.\d{2}\.\d{4})",
+        text[:8000],
+    )
+    return {
+        "title": ilex_document_heading(text),
+        "revision": revision,
+        "entry_into_force": entry_force.group(1) if entry_force else None,
+        "requires_related_review": document_requires_related_review(text),
+        "future_change_markers": extract_future_change_markers(
+            text, current_year=current_year
+        ),
+    }
+
+
+def related_search_query(text: str) -> str:
+    """Строит короткий запрос связанных актов без знания вида документа заранее."""
+    heading = ilex_document_heading(text)
+    tokens = []
+    for word in re.findall(r"[А-Яа-яЁёA-Za-z]{6,}", heading):
+        lowered = word.lower()
+        if lowered in _RELATION_STOPWORDS or lowered in tokens:
+            continue
+        tokens.append(lowered)
+    suffix = " ".join(tokens[:8])
+    return f"протокол изменения {suffix}".strip()
+
+
+def validate_legal_research_state(
+    requirements: list[dict],
+    related_assessments: list[dict] | None = None,
+    require_related_review: bool = True,
+) -> dict:
+    """Проверяет фактическое получение норм и оценку связанных документов."""
+    gaps = []
+    warnings = []
+    assessments = {
+        canonical_ilex_document_url(item.get("url", "")): item
+        for item in (related_assessments or [])
+        if item.get("url")
+    }
+    for requirement in requirements:
+        url = canonical_ilex_document_url(requirement.get("url", ""))
+        evidence = _LEGAL_RESEARCH_EVIDENCE.get(url)
+        if evidence is None:
+            gaps.append(f"Документ не был получен в этой MCP-сессии: {url}")
+            continue
+        if not evidence["revision_checked"]:
+            gaps.append(f"Не проверена актуальность документа: {url}")
+        for locator in requirement.get("sections", []):
+            try:
+                canonical = canonical_section_locator(locator)
+            except ValueError:
+                gaps.append(f"Не распознан номер нормы: {locator}")
+                continue
+            if canonical not in evidence["exact_sections"]:
+                gaps.append(f"Не получен точный текст {canonical}: {url}")
+        if require_related_review and not evidence["related_inspected"]:
+            gaps.append(f"Не выполнена проверка связанных актов: {url}")
+        for candidate in evidence.get("related_candidates", []):
+            candidate_url = canonical_ilex_document_url(candidate["url"])
+            candidate_evidence = _LEGAL_RESEARCH_EVIDENCE.get(candidate_url)
+            assessment = assessments.get(candidate_url)
+            checked = bool(
+                candidate_evidence
+                and (
+                    candidate_evidence["exact_sections"]
+                    or candidate_evidence["document_searched"]
+                    or candidate_evidence["full_text_loaded"]
+                )
+            )
+            if not checked and not assessment:
+                gaps.append(
+                    "Не оценен связанный BELAW-документ: "
+                    f"{candidate.get('title') or candidate_url} ({candidate_url})"
+                )
+            elif assessment and not assessment.get("reason"):
+                warnings.append(
+                    f"Для связанного документа не указано обоснование: {candidate_url}"
+                )
+    return {
+        "complete": not gaps,
+        "gaps": gaps,
+        "warnings": warnings,
+    }
+
+
 def add_unique_ilex_result(results: list[dict], result: dict, max_results: int) -> None:
     if len(results) >= max_results:
         return
@@ -1306,6 +1569,84 @@ async def list_tools() -> list[types.Tool]:
             }
         ),
         types.Tool(
+            name="inspect_ilex_document",
+            description=(
+                "Проверяет карточку первичного BELAW-документа перед правовым выводом: "
+                "возвращает заголовок, редакцию, дату вступления в силу и универсально ищет "
+                "связанные протоколы/изменяющие документы среди ранее полученных BELAW и "
+                "через поиск ILEX. Используй для каждого применимого документа в сложном "
+                "или многодокументном вопросе. Найденные связанные документы необходимо "
+                "получить либо явно оценить через validate_legal_research."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "URL первичного BELAW-документа"},
+                    "search_related": {
+                        "type": "boolean",
+                        "description": "Искать связанные акты через ILEX, если их нет в локальном индексе",
+                        "default": True,
+                    },
+                },
+                "required": ["url"],
+            },
+        ),
+        types.Tool(
+            name="validate_legal_research",
+            description=(
+                "Финальная машинная проверка полноты исследования. Проверяет, что в текущей "
+                "MCP-сессии действительно получены точные тексты всех обязательных норм, "
+                "проверена актуальность и выполнена оценка связанных BELAW-документов. "
+                "Правовой вывод разрешён только при complete=true. Инструмент не проверяет "
+                "правильность юридического толкования — её по-прежнему выполняет модель."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "requirements": {
+                        "type": "array",
+                        "description": "Обязательные документы и нормы для ответа",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "url": {"type": "string"},
+                                "sections": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                },
+                            },
+                            "required": ["url", "sections"],
+                        },
+                    },
+                    "related_assessments": {
+                        "type": "array",
+                        "description": (
+                            "Связанные документы, признанные неприменимыми; для каждого "
+                            "обязательно краткое обоснование"
+                        ),
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "url": {"type": "string"},
+                                "status": {
+                                    "type": "string",
+                                    "enum": ["not_applicable", "duplicate", "future"],
+                                },
+                                "reason": {"type": "string"},
+                            },
+                            "required": ["url", "status", "reason"],
+                        },
+                        "default": [],
+                    },
+                    "require_related_review": {
+                        "type": "boolean",
+                        "default": True,
+                    },
+                },
+                "required": ["requirements"],
+            },
+        ),
+        types.Tool(
             name="crawl_authenticated",
             description=(
                 "Скрапит страницу через реальный Chrome headless, используя активную сессию пользователя. "
@@ -1381,6 +1722,10 @@ async def dispatch_tool(name: str, arguments: dict) -> list[types.TextContent]:
         return await do_search_ilex_document(arguments)
     elif name == "get_ilex_sections":
         return await do_get_ilex_sections(arguments)
+    elif name == "inspect_ilex_document":
+        return await do_inspect_ilex_document(arguments)
+    elif name == "validate_legal_research":
+        return await do_validate_legal_research(arguments)
     elif name == "crawl_authenticated":
         return await do_crawl_authenticated(arguments)
     elif name == "download_pdf":
@@ -1502,6 +1847,14 @@ async def do_search_ilex_document(arguments: dict) -> list[types.TextContent]:
         result = search_with_structural_preference(
             pages, query, max_results=max_results, max_chars=max_chars
         )
+    evidence = _research_evidence(url)
+    evidence["document_searched"] = True
+    evidence["revision_checked"] = status in {
+        "cached", "downloaded", "updated", "refreshed"
+    }
+    locators = explicit_locators_from_query(query)
+    if locators:
+        record_exact_ilex_sections(url, locators, result, status)
     return [types.TextContent(type="text", text=note + result)]
 
 
@@ -1519,13 +1872,157 @@ async def do_get_ilex_sections(arguments: dict) -> list[types.TextContent]:
         result = extract_structured_sections(
             pages, sections, max_chars=max_chars, structure_index=index
         )
+    record_exact_ilex_sections(url, sections, result, status)
     return [types.TextContent(type="text", text=note + result)]
+
+
+async def do_inspect_ilex_document(arguments: dict) -> list[types.TextContent]:
+    url = arguments["url"]
+    search_related = arguments.get("search_related", True)
+    canonical_url = canonical_ilex_document_url(url)
+    existing_evidence = _LEGAL_RESEARCH_EVIDENCE.get(canonical_url)
+    cache_path = url_to_ilex_cache_path(url)
+    if (
+        existing_evidence
+        and existing_evidence["revision_checked"]
+        and cache_path.exists()
+    ):
+        try:
+            cached_data = json.loads(cache_path.read_text(encoding="utf-8"))
+            pages, status = [cached_data["text"]], "cached"
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+            pages, status = await fetch_ilex_pages(url, False)
+    else:
+        pages, status = await fetch_ilex_pages(url, False)
+    if isinstance(pages, str):
+        return [types.TextContent(type="text", text=pages)]
+
+    text = "\n\n".join(pages)
+    revision = None
+    try:
+        cache_data = json.loads(
+            url_to_ilex_cache_path(url).read_text(encoding="utf-8")
+        )
+        revision = cache_data.get("revision")
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        pass
+
+    metadata = ilex_document_metadata(text, revision)
+    candidates = (
+        discover_related_cached_ilex_documents(url, text)
+        if metadata["requires_related_review"] else []
+    )
+    search_error = None
+    live_search_performed = False
+    if search_related and metadata["requires_related_review"] and not candidates:
+        live_search_performed = True
+        try:
+            results = await search_ilex(related_search_query(text), 10)
+            for result in results:
+                candidate_url = canonical_ilex_document_url(result.get("url", ""))
+                candidate_title = result.get("title", "")
+                if (
+                    "/BELAW/" not in candidate_url
+                    or candidate_url == canonical_ilex_document_url(url)
+                    or not _RELATION_MARKER_RE.search(candidate_title)
+                ):
+                    continue
+                score = related_document_score(text, candidate_title)
+                if score < 0.35:
+                    continue
+                candidates.append({
+                    "url": candidate_url,
+                    "title": candidate_title,
+                    "score": round(score, 3),
+                    "source": "поиск связанных первичных документов ILEX",
+                })
+        except Exception as exc:
+            search_error = str(exc)
+
+    unique_candidates = {}
+    for candidate in candidates:
+        unique_candidates.setdefault(
+            canonical_ilex_document_url(candidate["url"]), candidate
+        )
+    candidates = list(unique_candidates.values())
+
+    evidence = _research_evidence(url)
+    evidence["revision_checked"] = status in {
+        "cached", "downloaded", "updated", "refreshed"
+    }
+    evidence["related_inspected"] = bool(
+        not metadata["requires_related_review"]
+        or candidates
+        or (live_search_performed and not search_error)
+    )
+    evidence["related_candidates"] = candidates
+
+    lines = [
+        ilex_cache_status_note(status).strip(),
+        f"Документ: {metadata['title'] or '(заголовок не распознан)'}",
+        f"URL: {canonical_ilex_document_url(url)}",
+        f"Редакция в заголовке ILEX: {metadata['revision'] or 'не указана'}",
+        f"Вступление в силу: {metadata['entry_into_force'] or 'не найдено в заголовочной части'}",
+    ]
+    if metadata["future_change_markers"]:
+        lines.append("\nОбнаружены маркеры будущих изменений; проверь их применимость:")
+        lines.extend(f"- {marker}" for marker in metadata["future_change_markers"])
+    else:
+        lines.append("\nЯвные маркеры будущих изменений в тексте не обнаружены.")
+    if candidates:
+        lines.append("\nСвязанные первичные BELAW-документы, требующие оценки:")
+        for candidate in candidates:
+            lines.append(
+                f"- {candidate['title']} — {candidate['url']} "
+                f"(источник: {candidate['source']})"
+            )
+    elif search_error:
+        lines.append(
+            "\n⚠️ Проверка связанных документов не завершена: "
+            f"{search_error}. До правового вывода повтори проверку."
+        )
+    elif metadata["requires_related_review"] and not search_related:
+        lines.append(
+            "\n⚠️ Проверка связанных документов ограничена локальным индексом "
+            "и не завершена. Повтори вызов с search_related=true."
+        )
+    elif metadata["requires_related_review"]:
+        source = "локальный индекс и поиск ILEX" if live_search_performed else "локальный индекс"
+        lines.append(f"\nСвязанные документы не обнаружены ({source}).")
+    else:
+        lines.append("\nОтдельная проверка связанных актов для этого вида документа не требуется.")
+    return [types.TextContent(type="text", text="\n".join(line for line in lines if line))]
+
+
+async def do_validate_legal_research(arguments: dict) -> list[types.TextContent]:
+    result = validate_legal_research_state(
+        arguments["requirements"],
+        arguments.get("related_assessments", []),
+        arguments.get("require_related_review", True),
+    )
+    if result["complete"]:
+        lines = [
+            "complete=true",
+            "Все заявленные нормы фактически получены; актуальность и связанные акты проверены.",
+        ]
+    else:
+        lines = [
+            "complete=false",
+            "Правовой вывод пока запрещён. Не устранены пробелы:",
+            *[f"- {gap}" for gap in result["gaps"]],
+        ]
+    if result["warnings"]:
+        lines.extend(["Предупреждения:", *[f"- {item}" for item in result["warnings"]]])
+    return [types.TextContent(type="text", text="\n".join(lines))]
 
 
 async def do_crawl_authenticated(arguments: dict) -> list[types.TextContent]:
     url = arguments["url"]
     try:
         text = await fetch_authenticated_page(url)
+        if is_ilex_url(url):
+            evidence = _research_evidence(url)
+            evidence["full_text_loaded"] = True
         return [types.TextContent(type="text", text=text or "(пустая страница)")]
     except Exception as e:
         return [types.TextContent(type="text", text=f"Ошибка: {e}")]

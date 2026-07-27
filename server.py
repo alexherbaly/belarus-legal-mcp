@@ -30,6 +30,12 @@ PDF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 ILEX_CACHE_DIR = Path.home() / ".claude" / "mcp_servers" / "ilex_cache"
 ILEX_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
+ILEX_SEARCH_CACHE_DIR = (
+    Path.home() / ".claude" / "mcp_servers" / "ilex_search_cache"
+)
+ILEX_SEARCH_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+ILEX_SEARCH_CACHE_TTL_SECONDS = 60 * 60
+
 PERF_LOG_PATH = (
     Path.home() / ".claude" / "mcp_servers" / "logs" / "belarus_legal_mcp.jsonl"
 )
@@ -630,6 +636,74 @@ def cache_status_note(status: str) -> str:
 CHROME_PROFILE_DIR = Path.home() / "Library" / "Application Support" / "Google" / "Chrome"
 
 
+def ilex_search_cache_path(query: str) -> Path:
+    normalized = re.sub(r"\s+", " ", query.strip().lower())
+    key = hashlib.sha256(normalized.encode()).hexdigest()
+    return ILEX_SEARCH_CACHE_DIR / f"{key}.json"
+
+
+def load_ilex_search_cache(
+    query: str,
+    max_results: int,
+    now: float | None = None,
+) -> list[dict] | None:
+    """Читает только свежую положительную выдачу достаточного размера."""
+    cache_path = ilex_search_cache_path(query)
+    try:
+        data = json.loads(cache_path.read_text(encoding="utf-8"))
+        age = (time.time() if now is None else now) - data["cached_at"]
+        cached_max_results = data.get("max_results", 0)
+        results = data.get("results", [])
+        if (
+            0 <= age <= ILEX_SEARCH_CACHE_TTL_SECONDS
+            and cached_max_results >= max_results
+            and results
+        ):
+            log_perf(
+                "ilex_search_cache_hit",
+                age_seconds=round(age, 2),
+                result_count=min(len(results), max_results),
+            )
+            return results[:max_results]
+    except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+        pass
+
+    if cache_path.exists():
+        try:
+            cache_path.unlink()
+        except OSError:
+            pass
+    return None
+
+
+def save_ilex_search_cache(
+    query: str,
+    max_results: int,
+    results: list[dict],
+) -> None:
+    """Атомарно кеширует выдачу; сам пользовательский запрос не сохраняется."""
+    if not results:
+        return
+    cache_path = ilex_search_cache_path(query)
+    temp_path = cache_path.with_suffix(f".{uuid.uuid4().hex}.tmp")
+    data = {
+        "cached_at": time.time(),
+        "max_results": max_results,
+        "results": results,
+    }
+    try:
+        temp_path.write_text(
+            json.dumps(data, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        temp_path.replace(cache_path)
+    except OSError:
+        try:
+            temp_path.unlink()
+        except OSError:
+            pass
+
+
 class PersistentChromeSession:
     """Одна авторизованная Chrome-сессия на весь срок жизни MCP-процесса."""
 
@@ -668,7 +742,9 @@ class PersistentChromeSession:
             self._profile_dir = None
 
     async def _ensure_started_unlocked(self) -> None:
+        import platform
         import shutil
+        import subprocess
         import tempfile
         from playwright.async_api import async_playwright
 
@@ -679,16 +755,35 @@ class PersistentChromeSession:
         await self._close_unlocked()
         self._profile_dir = Path(tempfile.mkdtemp())
         with perf_stage("chrome_profile_copy"):
-            shutil.copytree(
-                CHROME_PROFILE_DIR / "Default",
-                self._profile_dir / "Default",
-                ignore=shutil.ignore_patterns(
-                    "SingletonLock",
-                    "SingletonCookie",
-                    "SingletonSocket",
-                    "lockfile",
-                ),
-            )
+            profile_src = CHROME_PROFILE_DIR / "Default"
+            profile_dest = self._profile_dir / "Default"
+            copied = False
+            if platform.system() == "Darwin":
+                try:
+                    result = subprocess.run(
+                        ["/bin/cp", "-cR", str(profile_src), str(profile_dest)],
+                        capture_output=True,
+                        timeout=30,
+                    )
+                    copied = result.returncode == 0
+                except (OSError, subprocess.TimeoutExpired):
+                    copied = False
+                if not copied:
+                    shutil.rmtree(profile_dest, ignore_errors=True)
+            if copied:
+                log_perf("chrome_profile_copy_method", method="apfs_clone")
+            else:
+                shutil.copytree(
+                    profile_src,
+                    profile_dest,
+                    ignore=shutil.ignore_patterns(
+                        "SingletonLock",
+                        "SingletonCookie",
+                        "SingletonSocket",
+                        "lockfile",
+                    ),
+                )
+                log_perf("chrome_profile_copy_method", method="regular")
         self._playwright = await async_playwright().start()
         with perf_stage("chrome_launch"):
             self._context = await self._playwright.chromium.launch_persistent_context(
@@ -734,6 +829,10 @@ async def search_ilex(query: str, max_results: int = 10) -> list[dict]:
     (например, таблицу «Избежание двойного налогообложения»). Их строки приходят
     отдельным запросом classifier/content и поэтому раньше были невидимы MCP.
     """
+    cached_results = load_ilex_search_cache(query, max_results)
+    if cached_results is not None:
+        return cached_results
+
     results = []
     async with ILEX_BROWSER.page() as page:
         # Перехватываем как обычную выдачу, так и тематические классификаторы.
@@ -846,6 +945,7 @@ async def search_ilex(query: str, max_results: int = 10) -> list[dict]:
                         "source": "страница результатов",
                     }, max_results)
 
+    save_ilex_search_cache(query, max_results, results)
     return results
 
 

@@ -1,9 +1,16 @@
 import unittest
+import tempfile
+import time
+from pathlib import Path
+from unittest.mock import patch
 
 from server import (
     canonical_ilex_document_url,
+    ilex_search_cache_path,
+    load_ilex_search_cache,
     parse_ilex_classifier_link,
     parse_ilex_classifier_results,
+    save_ilex_search_cache,
 )
 
 
@@ -52,6 +59,36 @@ class IlexClassifierTests(unittest.TestCase):
             ),
             "https://ilex-private.ilex.by/view-document/BELAW/13142/",
         )
+
+    def test_search_cache_reuses_only_fresh_positive_results(self):
+        results = [{
+            "title": "Трудовой кодекс",
+            "url": "https://ilex-private.ilex.by/view-document/BELAW/219268/",
+            "snippet": "",
+            "source": "обычная выдача",
+        }]
+        with tempfile.TemporaryDirectory() as temp_dir, patch(
+            "server.ILEX_SEARCH_CACHE_DIR", Path(temp_dir)
+        ), patch("server.ILEX_SEARCH_CACHE_TTL_SECONDS", 60):
+            save_ilex_search_cache("статья 32 трудового кодекса", 5, results)
+
+            self.assertEqual(
+                load_ilex_search_cache("статья 32 трудового кодекса", 5),
+                results,
+            )
+            self.assertNotIn(
+                "статья 32 трудового кодекса",
+                ilex_search_cache_path(
+                    "статья 32 трудового кодекса"
+                ).read_text(encoding="utf-8"),
+            )
+            self.assertIsNone(
+                load_ilex_search_cache(
+                    "статья 32 трудового кодекса",
+                    5,
+                    now=time.time() + 61,
+                )
+            )
 
 
 if __name__ == "__main__":

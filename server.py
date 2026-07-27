@@ -8,7 +8,7 @@ import re
 import time
 import uuid
 from bisect import bisect_right
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime
 from pathlib import Path
 from mcp.server import Server
@@ -630,6 +630,102 @@ def cache_status_note(status: str) -> str:
 CHROME_PROFILE_DIR = Path.home() / "Library" / "Application Support" / "Google" / "Chrome"
 
 
+class PersistentChromeSession:
+    """Одна авторизованная Chrome-сессия на весь срок жизни MCP-процесса."""
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._playwright = None
+        self._context = None
+        self._profile_dir: Path | None = None
+
+    def _is_connected(self) -> bool:
+        if self._context is None:
+            return False
+        try:
+            browser = self._context.browser
+            return browser is not None and browser.is_connected()
+        except Exception:
+            return False
+
+    async def _close_unlocked(self) -> None:
+        import shutil
+
+        if self._context is not None:
+            try:
+                await self._context.close()
+            except Exception:
+                pass
+            self._context = None
+        if self._playwright is not None:
+            try:
+                await self._playwright.stop()
+            except Exception:
+                pass
+            self._playwright = None
+        if self._profile_dir is not None:
+            shutil.rmtree(self._profile_dir, ignore_errors=True)
+            self._profile_dir = None
+
+    async def _ensure_started_unlocked(self) -> None:
+        import shutil
+        import tempfile
+        from playwright.async_api import async_playwright
+
+        if self._is_connected():
+            log_perf("browser_reused")
+            return
+
+        await self._close_unlocked()
+        self._profile_dir = Path(tempfile.mkdtemp())
+        with perf_stage("chrome_profile_copy"):
+            shutil.copytree(
+                CHROME_PROFILE_DIR / "Default",
+                self._profile_dir / "Default",
+                ignore=shutil.ignore_patterns(
+                    "SingletonLock",
+                    "SingletonCookie",
+                    "SingletonSocket",
+                    "lockfile",
+                ),
+            )
+        self._playwright = await async_playwright().start()
+        with perf_stage("chrome_launch"):
+            self._context = await self._playwright.chromium.launch_persistent_context(
+                user_data_dir=str(self._profile_dir),
+                channel="chrome",
+                headless=True,
+                args=["--profile-directory=Default"],
+                accept_downloads=True,
+            )
+
+    @asynccontextmanager
+    async def page(self):
+        """
+        Сериализует операции ilex: сайт и профиль стабильнее работают с одной
+        вкладкой за раз, а LLM обычно всё равно вызывает инструменты последовательно.
+        """
+        async with self._lock:
+            await self._ensure_started_unlocked()
+            page = await self._context.new_page()
+            try:
+                yield page
+            finally:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+                if not self._is_connected():
+                    await self._close_unlocked()
+
+    async def close(self) -> None:
+        async with self._lock:
+            await self._close_unlocked()
+
+
+ILEX_BROWSER = PersistentChromeSession()
+
+
 async def search_ilex(query: str, max_results: int = 10) -> list[dict]:
     """
     Ищет документы на ilex.by через поисковую строку.
@@ -638,146 +734,117 @@ async def search_ilex(query: str, max_results: int = 10) -> list[dict]:
     (например, таблицу «Избежание двойного налогообложения»). Их строки приходят
     отдельным запросом classifier/content и поэтому раньше были невидимы MCP.
     """
-    import shutil
-    import tempfile
-    from playwright.async_api import async_playwright
-
-    profile_src = CHROME_PROFILE_DIR / "Default"
-    tmp_dir = Path(tempfile.mkdtemp())
     results = []
-    try:
-        with perf_stage("chrome_profile_copy"):
-            shutil.copytree(
-                profile_src, tmp_dir / "Default",
-                ignore=shutil.ignore_patterns("SingletonLock", "SingletonCookie", "SingletonSocket", "lockfile"),
+    async with ILEX_BROWSER.page() as page:
+        # Перехватываем как обычную выдачу, так и тематические классификаторы.
+        search_data = {}
+        extended_loaded = asyncio.Event()
+        smart_entities_loaded = asyncio.Event()
+        classifier_loaded = asyncio.Event()
+        classifier_expected = False
+
+        async def capture(response):
+            nonlocal classifier_expected
+            if any(endpoint in response.url for endpoint in (
+                "search/extended", "search/autocomplete", "search/smart-entities",
+                "classifier/content"
+            )):
+                try:
+                    data = await response.json()
+                    search_data[response.url] = data
+                    if "search/extended" in response.url:
+                        extended_loaded.set()
+                    elif "search/smart-entities" in response.url:
+                        classifier_expected = bool(
+                            isinstance(data, dict) and data.get("classifierBlockModel")
+                        )
+                        smart_entities_loaded.set()
+                    elif "classifier/content" in response.url:
+                        classifier_loaded.set()
+                except Exception:
+                    pass
+        page.on("response", capture)
+
+        with perf_stage("ilex_home_load"):
+            await page.goto(
+                "https://ilex-private.ilex.by/home",
+                wait_until="networkidle",
+                timeout=30000,
             )
-        async with async_playwright() as p:
-            with perf_stage("chrome_launch"):
-                ctx = await p.chromium.launch_persistent_context(
-                    user_data_dir=str(tmp_dir),
-                    channel="chrome",
-                    headless=True,
-                    args=["--profile-directory=Default"],
-                )
-            page = await ctx.new_page()
 
-            # Перехватываем как обычную выдачу, так и тематические классификаторы.
-            search_data = {}
-            extended_loaded = asyncio.Event()
-            smart_entities_loaded = asyncio.Event()
-            classifier_loaded = asyncio.Event()
-            classifier_expected = False
+        inp = await page.query_selector("input.search-input")
+        if inp is None:
+            raise RuntimeError(
+                "Поле поиска не найдено на странице ilex.by — вероятно, сессия не авторизована "
+                "(нужно войти в ilex.by в Chrome под тем же профилем) либо страница не успела "
+                "загрузиться."
+            )
+        with perf_stage("ilex_search_wait"):
+            await inp.click()
+            await inp.fill(query)
+            await page.wait_for_timeout(1500)
 
-            async def capture(response):
-                nonlocal classifier_expected
-                if any(endpoint in response.url for endpoint in (
-                    "search/extended", "search/autocomplete", "search/smart-entities",
-                    "classifier/content"
-                )):
-                    try:
-                        data = await response.json()
-                        search_data[response.url] = data
-                        if "search/extended" in response.url:
-                            extended_loaded.set()
-                        elif "search/smart-entities" in response.url:
-                            classifier_expected = bool(
-                                isinstance(data, dict) and data.get("classifierBlockModel")
-                            )
-                            smart_entities_loaded.set()
-                        elif "classifier/content" in response.url:
-                            classifier_loaded.set()
-                    except Exception:
-                        pass
-            page.on("response", capture)
+            btn = await page.query_selector("button.search-button")
+            if btn:
+                await btn.click()
+            else:
+                await inp.press("Enter")
 
-            with perf_stage("ilex_home_load"):
-                await page.goto(
-                    "https://ilex-private.ilex.by/home",
-                    wait_until="networkidle",
-                    timeout=30000,
-                )
+            await page.wait_for_load_state("networkidle", timeout=15000)
+            # Обычная и тематическая выдачи загружаются независимо.
+            for event, timeout in ((extended_loaded, 5), (smart_entities_loaded, 5)):
+                try:
+                    await asyncio.wait_for(event.wait(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    pass
+            if classifier_expected and not classifier_loaded.is_set():
+                try:
+                    await asyncio.wait_for(classifier_loaded.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    pass
 
-            inp = await page.query_selector("input.search-input")
-            if inp is None:
-                await ctx.close()
-                raise RuntimeError(
-                    "Поле поиска не найдено на странице ilex.by — вероятно, сессия не авторизована "
-                    "(нужно войти в ilex.by в Chrome под тем же профилем) либо страница не успела "
-                    "загрузиться."
-                )
-            with perf_stage("ilex_search_wait"):
-                await inp.click()
-                await inp.fill(query)
-                await page.wait_for_timeout(1500)
+        # Тематический классификатор содержит более точные прямые ссылки на НПА.
+        for url, data in search_data.items():
+            if "classifier/content" in url and isinstance(data, dict):
+                results.extend(parse_ilex_classifier_results(data, max_results))
 
-                btn = await page.query_selector("button.search-button")
-                if btn:
-                    await btn.click()
-                else:
-                    await inp.press("Enter")
-
-                await page.wait_for_load_state("networkidle", timeout=15000)
-                # Обычная и тематическая выдачи загружаются независимо. Ждём фактические
-                # API-ответы вместо фиксированной паузы, чтобы не пропустить более медленный
-                # classifier/content и не замедлять запросы без тематического блока.
-                for event, timeout in ((extended_loaded, 5), (smart_entities_loaded, 5)):
-                    try:
-                        await asyncio.wait_for(event.wait(), timeout=timeout)
-                    except asyncio.TimeoutError:
-                        pass
-                if classifier_expected and not classifier_loaded.is_set():
-                    try:
-                        await asyncio.wait_for(classifier_loaded.wait(), timeout=5)
-                    except asyncio.TimeoutError:
-                        pass
-
-            # Тематический классификатор содержит более точные прямые ссылки на НПА,
-            # поэтому ставим его результаты перед полнотекстовой выдачей.
-            for url, data in search_data.items():
-                if "classifier/content" in url and isinstance(data, dict):
-                    results.extend(parse_ilex_classifier_results(data, max_results))
-
-            # Парсим обычные результаты из перехваченного API.
-            for url, data in search_data.items():
-                if "search/extended" in url and isinstance(data, dict):
-                    hits = data.get("hits", [])
-                    for hit in hits:
-                        infobank = hit.get("infoBank", {}).get("value", "")
-                        num = hit.get("numberInInfoBank")
-                        name = hit.get("name", "").replace("<em>", "").replace("</em>", "")
-                        snippet = hit.get("snippet", "").replace("<em>", "").replace("</em>", "")
-                        if infobank and num:
-                            doc_url = f"https://ilex-private.ilex.by/view-document/{infobank}/{num}/"
-                            add_unique_ilex_result(results, {
-                                "title": name,
-                                "url": doc_url,
-                                "snippet": snippet,
-                                "source": "обычная выдача",
-                            }, max_results)
-                        if len(results) >= max_results:
-                            break
-                    break
-
-            # Fallback: парсим ссылки со страницы
-            if not results:
-                links = await page.query_selector_all("a[href*='view-document']")
-                seen = set()
-                for link in links[:max_results]:
-                    href = await link.get_attribute("href")
-                    text = (await link.inner_text()).strip()
-                    if href and href not in seen:
-                        seen.add(href)
-                        full = href if href.startswith("http") else f"https://ilex-private.ilex.by{href}"
+        # Парсим обычные результаты из перехваченного API.
+        for url, data in search_data.items():
+            if "search/extended" in url and isinstance(data, dict):
+                hits = data.get("hits", [])
+                for hit in hits:
+                    infobank = hit.get("infoBank", {}).get("value", "")
+                    num = hit.get("numberInInfoBank")
+                    name = hit.get("name", "").replace("<em>", "").replace("</em>", "")
+                    snippet = hit.get("snippet", "").replace("<em>", "").replace("</em>", "")
+                    if infobank and num:
+                        doc_url = f"https://ilex-private.ilex.by/view-document/{infobank}/{num}/"
                         add_unique_ilex_result(results, {
-                            "title": text[:120],
-                            "url": full,
-                            "snippet": "",
-                            "source": "страница результатов",
+                            "title": name,
+                            "url": doc_url,
+                            "snippet": snippet,
+                            "source": "обычная выдача",
                         }, max_results)
+                    if len(results) >= max_results:
+                        break
+                break
 
-            await ctx.close()
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+        # Fallback: парсим ссылки со страницы.
+        if not results:
+            links = await page.query_selector_all("a[href*='view-document']")
+            seen = set()
+            for link in links[:max_results]:
+                href = await link.get_attribute("href")
+                text = (await link.inner_text()).strip()
+                if href and href not in seen:
+                    seen.add(href)
+                    full = href if href.startswith("http") else f"https://ilex-private.ilex.by{href}"
+                    add_unique_ilex_result(results, {
+                        "title": text[:120],
+                        "url": full,
+                        "snippet": "",
+                        "source": "страница результатов",
+                    }, max_results)
 
     return results
 
@@ -861,41 +928,18 @@ async def get_ilex_title(url: str) -> str:
     Быстро получает title страницы документа ilex.by (без клика по экспорту в Word) —
     используется только для проверки актуальности редакции перед решением, брать ли кеш.
     """
-    import shutil
-    import tempfile
-    from playwright.async_api import async_playwright
-
-    profile_src = CHROME_PROFILE_DIR / "Default"
-    tmp_dir = Path(tempfile.mkdtemp())
-    try:
-        with perf_stage("chrome_profile_copy"):
-            shutil.copytree(
-                profile_src, tmp_dir / "Default",
-                ignore=shutil.ignore_patterns("SingletonLock", "SingletonCookie", "SingletonSocket", "lockfile"),
+    async with ILEX_BROWSER.page() as page:
+        with perf_stage("ilex_revision_page_load"):
+            await page.goto(
+                url, wait_until="domcontentloaded", timeout=30000
             )
-        async with async_playwright() as p:
-            with perf_stage("chrome_launch"):
-                ctx = await p.chromium.launch_persistent_context(
-                    user_data_dir=str(tmp_dir),
-                    channel="chrome",
-                    headless=True,
-                    args=["--profile-directory=Default"],
-                )
-            page = await ctx.new_page()
-            with perf_stage("ilex_revision_page_load"):
-                await page.goto(
-                    url, wait_until="domcontentloaded", timeout=30000
-                )
-            title = ""
-            for _ in range(10):
-                title = await page.title()
-                if title:
-                    break
-                await page.wait_for_timeout(300)
-            await ctx.close()
+        title = ""
+        for _ in range(10):
+            title = await page.title()
+            if title:
+                break
+            await page.wait_for_timeout(300)
         return title
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def rtf_to_plain_text(rtf_path: Path) -> str:
@@ -929,26 +973,10 @@ async def get_ilex_document_content(url: str) -> tuple[str, str | None]:
     """
     import shutil
     import tempfile
-    from playwright.async_api import async_playwright
 
-    profile_src = CHROME_PROFILE_DIR / "Default"
-    tmp_dir = Path(tempfile.mkdtemp())
+    export_dir = Path(tempfile.mkdtemp())
     try:
-        with perf_stage("chrome_profile_copy"):
-            shutil.copytree(
-                profile_src, tmp_dir / "Default",
-                ignore=shutil.ignore_patterns("SingletonLock", "SingletonCookie", "SingletonSocket", "lockfile"),
-            )
-        async with async_playwright() as p:
-            with perf_stage("chrome_launch"):
-                ctx = await p.chromium.launch_persistent_context(
-                    user_data_dir=str(tmp_dir),
-                    channel="chrome",
-                    headless=True,
-                    args=["--profile-directory=Default"],
-                    accept_downloads=True,
-                )
-            page = await ctx.new_page()
+        async with ILEX_BROWSER.page() as page:
             with perf_stage("ilex_document_page_load"):
                 await page.goto(url, wait_until="networkidle", timeout=30000)
             title = await page.title()
@@ -959,17 +987,15 @@ async def get_ilex_document_content(url: str) -> tuple[str, str | None]:
                     async with page.expect_download(timeout=90000) as download_info:
                         await export_btn.click()
                     download = await download_info.value
-                    rtf_path = tmp_dir / "export.rtf"
+                    rtf_path = export_dir / "export.rtf"
                     await download.save_as(rtf_path)
-                await ctx.close()
                 with perf_stage("rtf_to_text"):
                     text = rtf_to_plain_text(rtf_path)
             else:
                 content_el = await page.query_selector("#documentContent")
                 text = await content_el.inner_text() if content_el else await page.inner_text("body")
-                await ctx.close()
     finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+        shutil.rmtree(export_dir, ignore_errors=True)
 
     revision = extract_ilex_revision(title)
     return text, revision
@@ -1049,31 +1075,10 @@ async def fetch_authenticated_page(url: str) -> str:
         text, _ = await get_ilex_document_content(url)
         return text
 
-    import shutil
-    import tempfile
-    from playwright.async_api import async_playwright
-
-    profile_src = CHROME_PROFILE_DIR / "Default"
-    tmp_dir = Path(tempfile.mkdtemp())
-    try:
-        shutil.copytree(
-            profile_src, tmp_dir / "Default",
-            ignore=shutil.ignore_patterns("SingletonLock", "SingletonCookie", "SingletonSocket", "lockfile"),
-        )
-        async with async_playwright() as p:
-            ctx = await p.chromium.launch_persistent_context(
-                user_data_dir=str(tmp_dir),
-                channel="chrome",
-                headless=True,
-                args=["--profile-directory=Default"],
-            )
-            page = await ctx.new_page()
-            await page.goto(url, wait_until="networkidle", timeout=30000)
-            text = await page.inner_text("body")
-            await ctx.close()
+    async with ILEX_BROWSER.page() as page:
+        await page.goto(url, wait_until="networkidle", timeout=30000)
+        text = await page.inner_text("body")
         return text
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 @server.list_tools()
@@ -1473,8 +1478,15 @@ async def do_get_pdf_sections(arguments: dict) -> list[types.TextContent]:
 
 
 async def main():
-    async with stdio_server() as (read_stream, write_stream):
-        await server.run(read_stream, write_stream, server.create_initialization_options())
+    try:
+        async with stdio_server() as (read_stream, write_stream):
+            await server.run(
+                read_stream,
+                write_stream,
+                server.create_initialization_options(),
+            )
+    finally:
+        await ILEX_BROWSER.close()
 
 if __name__ == "__main__":
     asyncio.run(main())

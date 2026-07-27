@@ -2,8 +2,8 @@
 
 MCP-сервер для Claude Desktop, который добавляет инструменты для работы с белорусским законодательством:
 
-- **pravo.by** — скачивание и поиск по PDF с автопроверкой актуальности редакции
-- **ilex.by** — поиск и чтение документов через авторизованную сессию Chrome
+- **ilex.by** — основной источник: поиск и точечное чтение первичных документов BELAW через авторизованную сессию Chrome. Это источник по умолчанию в рекомендуемом системном промпте (см. [`AGENTS.md`](AGENTS.md)).
+- **pravo.by** — скачивание и поиск по PDF/HTML-карточкам с автопроверкой актуальности редакции. Инструменты остаются в сервере и доступны, но рекомендуемый промпт использует pravo.by только по отдельному разрешению пользователя (см. раздел «Системный промпт») — как источник, дающий целые консолидированные кодексы вместо точечных норм, он легко расходует контекст на объёмных документах.
 
 ## Инструменты
 
@@ -23,16 +23,16 @@ MCP-сервер для Claude Desktop, который добавляет инс
 
 ## Установка
 
+Конфиг Claude Desktop запускает `server.py` напрямую из клонированного
+репозитория — отдельно копировать файл никуда не нужно (и не нужно повторять
+копирование после каждого изменения кода).
+
 ### macOS
 
 ```bash
-# 1. Создать окружение
 python3 -m venv ~/.claude/mcp_servers/crawl4ai_env
 ~/.claude/mcp_servers/crawl4ai_env/bin/pip install .
 ~/.claude/mcp_servers/crawl4ai_env/bin/playwright install chromium
-
-# 2. Скопировать сервер
-cp server.py ~/.claude/mcp_servers/crawl4ai_server.py
 ```
 
 Добавить в `~/Library/Application Support/Claude/claude_desktop_config.json`:
@@ -42,7 +42,7 @@ cp server.py ~/.claude/mcp_servers/crawl4ai_server.py
   "mcpServers": {
     "crawl4ai": {
       "command": "/Users/ИМЯ/.claude/mcp_servers/crawl4ai_env/bin/python",
-      "args": ["/Users/ИМЯ/.claude/mcp_servers/crawl4ai_server.py"]
+      "args": ["/ПУТЬ/ДО/belarus-legal-mcp/server.py"]
     }
   }
 }
@@ -63,13 +63,15 @@ python -m venv %USERPROFILE%\.claude\mcp_servers\crawl4ai_env
   "mcpServers": {
     "crawl4ai": {
       "command": "C:\\Users\\ИМЯ\\.claude\\mcp_servers\\crawl4ai_env\\Scripts\\python.exe",
-      "args": ["C:\\Users\\ИМЯ\\.claude\\mcp_servers\\crawl4ai_server.py"]
+      "args": ["C:\\ПУТЬ\\ДО\\belarus-legal-mcp\\server.py"]
     }
   }
 }
 ```
 
-> Замените `ИМЯ` на ваше имя пользователя.
+> Замените `ИМЯ` на ваше имя пользователя и `/ПУТЬ/ДО/belarus-legal-mcp` — на
+> путь к клонированному репозиторию. После изменений в `server.py` достаточно
+> перезапустить Claude Desktop — копировать файл никуда не нужно.
 
 Команды `pip install .` нужно выполнять из папки этого проекта. Для проверки
 изменений запустите:
@@ -83,6 +85,10 @@ python -m unittest discover -s tests -v
 ## Использование
 
 ### Работа с pravo.by
+
+По умолчанию рекомендуемый промпт использует эти инструменты только с явного
+разрешения пользователя (см. «Системный промпт» ниже) — основной путь для
+юридических вопросов идёт через ilex.by.
 
 ```
 Скачай документ: https://pravo.by/upload/docs/op/W21226212_1344459600.pdf

@@ -1,6 +1,7 @@
 import asyncio
 import json
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -275,6 +276,48 @@ class LegalResearchCompletenessTests(unittest.TestCase):
 
         fetch.assert_not_awaited()
         self.assertIn("21 января 1997 года", result[0].text)
+
+    def test_stale_evidence_is_not_counted_as_obtained(self):
+        # Evidence живёт весь срок MCP-процесса, а не одного диалога. Без TTL
+        # запись, сделанная в давно завершённом (или не связанном) разговоре,
+        # тихо засчиталась бы как "получено" для текущего вопроса.
+        evidence = server._research_evidence(TAX_CODE_URL)
+        evidence["revision_checked"] = True
+        evidence["related_inspected"] = True
+        evidence["exact_sections"] = {"статья 197"}
+        evidence["updated_at"] = time.time() - server.EVIDENCE_TTL_SECONDS - 1
+
+        result = server.validate_legal_research_state([
+            {"url": TAX_CODE_URL, "sections": ["статья 197"]},
+        ])
+
+        self.assertFalse(result["complete"])
+        self.assertTrue(any(
+            "не был получен в этой MCP-сессии" in gap for gap in result["gaps"]
+        ))
+
+    def test_return_and_credit_checks_require_tax_context(self):
+        # "возврат" (товара, депозита) и "зачёт" (встречных требований) — общие
+        # гражданско-правовые термины. Без упоминания налогов в вопросе эти
+        # проверки не должны требовать не относящихся к делу налоговых норм.
+        question = (
+            "Правомерен ли возврат товара ненадлежащего качества и зачёт "
+            "встречных однородных требований по договору поставки?"
+        )
+        evidence = server._research_evidence(AGREEMENT_URL)
+        evidence["revision_checked"] = True
+        evidence["related_inspected"] = True
+        evidence["exact_sections"] = {"статья 1"}
+        evidence["exact_section_texts"] = {
+            "статья 1": "Покупатель вправе отказаться от товара ненадлежащего качества."
+        }
+
+        result = server.validate_legal_research_state(
+            [{"url": AGREEMENT_URL, "sections": ["статья 1"]}],
+            question=question,
+        )
+
+        self.assertTrue(result["complete"], result["gaps"])
 
 
 if __name__ == "__main__":

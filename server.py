@@ -50,6 +50,11 @@ _PERF_CALL_ID = contextvars.ContextVar("perf_call_id", default=None)
 _PERF_TOOL_NAME = contextvars.ContextVar("perf_tool_name", default=None)
 _last_tool_finished_at: float | None = None
 _LEGAL_RESEARCH_EVIDENCE: dict[str, dict] = {}
+# _LEGAL_RESEARCH_EVIDENCE живёt весь срок MCP-процесса и не привязан к
+# конкретному диалогу. Без TTL доказательства, полученные в одном (давно
+# завершённом или вообще другом) разговоре, могли бы тихо засчитаться в
+# validate_legal_research для не связанного с ними вопроса.
+EVIDENCE_TTL_SECONDS = 30 * 60
 
 
 def log_perf(event: str, **fields) -> None:
@@ -822,6 +827,9 @@ class PersistentChromeSession:
 ILEX_BROWSER = PersistentChromeSession()
 
 
+_ILEX_SESSION_ERROR_MARKER = "сессия не авторизована"
+
+
 async def search_ilex(query: str, max_results: int = 10) -> list[dict]:
     """
     Ищет документы на ilex.by через поисковую строку.
@@ -834,6 +842,24 @@ async def search_ilex(query: str, max_results: int = 10) -> list[dict]:
     if cached_results is not None:
         return cached_results
 
+    try:
+        results = await _search_ilex_once(query, max_results)
+    except RuntimeError as exc:
+        # Профиль Chrome копируется один раз на весь срок MCP-процесса
+        # (PersistentChromeSession). Если реальная сессия в Chrome обновилась
+        # и протухший клон больше не авторизован — переклонируем профиль один
+        # раз и повторим, прежде чем сообщать пользователю о неавторизованной
+        # сессии (которая на деле может быть просто устаревшим снимком).
+        if _ILEX_SESSION_ERROR_MARKER not in str(exc):
+            raise
+        await ILEX_BROWSER.close()
+        results = await _search_ilex_once(query, max_results)
+
+    save_ilex_search_cache(query, max_results, results)
+    return results
+
+
+async def _search_ilex_once(query: str, max_results: int) -> list[dict]:
     results = []
     async with ILEX_BROWSER.page() as page:
         # Перехватываем как обычную выдачу, так и тематические классификаторы.
@@ -946,7 +972,6 @@ async def search_ilex(query: str, max_results: int = 10) -> list[dict]:
                         "source": "страница результатов",
                     }, max_results)
 
-    save_ilex_search_cache(query, max_results, results)
     return results
 
 
@@ -976,7 +1001,7 @@ def canonical_section_locator(locator: str) -> str:
 
 def _research_evidence(url: str) -> dict:
     canonical = canonical_ilex_document_url(url)
-    return _LEGAL_RESEARCH_EVIDENCE.setdefault(canonical, {
+    evidence = _LEGAL_RESEARCH_EVIDENCE.setdefault(canonical, {
         "url": canonical,
         "exact_sections": set(),
         "exact_section_texts": {},
@@ -987,6 +1012,19 @@ def _research_evidence(url: str) -> dict:
         "related_candidates": [],
         "document_title": "",
     })
+    evidence["updated_at"] = time.time()
+    return evidence
+
+
+def _fresh_evidence(url: str) -> dict | None:
+    """Возвращает evidence только если оно записано не более EVIDENCE_TTL_SECONDS назад."""
+    canonical = canonical_ilex_document_url(url)
+    evidence = _LEGAL_RESEARCH_EVIDENCE.get(canonical)
+    if evidence is None:
+        return None
+    if time.time() - evidence.get("updated_at", 0) > EVIDENCE_TTL_SECONDS:
+        return None
+    return evidence
 
 
 def record_exact_ilex_sections(
@@ -1197,7 +1235,7 @@ def validate_legal_research_state(
     }
     for requirement in requirements:
         url = canonical_ilex_document_url(requirement.get("url", ""))
-        evidence = _LEGAL_RESEARCH_EVIDENCE.get(url)
+        evidence = _fresh_evidence(url)
         if evidence is None:
             gaps.append(f"Документ не был получен в этой MCP-сессии: {url}")
             continue
@@ -1215,7 +1253,7 @@ def validate_legal_research_state(
             gaps.append(f"Не выполнена проверка связанных актов: {url}")
         for candidate in evidence.get("related_candidates", []):
             candidate_url = canonical_ilex_document_url(candidate["url"])
-            candidate_evidence = _LEGAL_RESEARCH_EVIDENCE.get(candidate_url)
+            candidate_evidence = _fresh_evidence(candidate_url)
             assessment = assessments.get(candidate_url)
             checked = bool(
                 candidate_evidence
@@ -1244,7 +1282,7 @@ def validate_legal_research_state(
     titled_evidence_texts = []
     for requirement in requirements:
         url = canonical_ilex_document_url(requirement.get("url", ""))
-        evidence = _LEGAL_RESEARCH_EVIDENCE.get(url)
+        evidence = _fresh_evidence(url)
         if not evidence:
             continue
         for section_text in evidence["exact_section_texts"].values():
@@ -1282,7 +1320,13 @@ def validate_legal_research_state(
                 "источнике дохода и влиянии места фактической работы."
             )
 
-    if "возврат" in question_lower:
+    # "возврат"/"зачёт" — общеупотребимые гражданско-правовые термины (возврат
+    # товара, зачёт встречных требований), не только налоговые. Без требования
+    # налогового контекста в самом вопросе эти проверки ложно блокировали бы
+    # ответ на любой вопрос о возврате/зачёте, не имеющий отношения к налогам.
+    tax_context = re.search(r"налог|подоходн|удерж", question_lower)
+
+    if "возврат" in question_lower and tax_context:
         if not (
             "излишне удержан" in combined_text
             and re.search(
@@ -1296,7 +1340,7 @@ def validate_legal_research_state(
                 "излишнем удержании и возврате по международному договору."
             )
 
-    if re.search(r"зач[её]т", question_lower):
+    if re.search(r"зач[её]т", question_lower) and tax_context:
         treaty_credit = any(
             re.search(r"соглашение|конвенция|протокол", title, re.IGNORECASE)
             and re.search(r"вычтен\w*\s+из\s+сумм\w+\s+налог", text, re.IGNORECASE)
@@ -1978,7 +2022,7 @@ async def do_inspect_ilex_document(arguments: dict) -> list[types.TextContent]:
     url = arguments["url"]
     search_related = arguments.get("search_related", True)
     canonical_url = canonical_ilex_document_url(url)
-    existing_evidence = _LEGAL_RESEARCH_EVIDENCE.get(canonical_url)
+    existing_evidence = _fresh_evidence(canonical_url)
     cache_path = url_to_ilex_cache_path(url)
     if (
         existing_evidence

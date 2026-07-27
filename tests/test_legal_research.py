@@ -88,6 +88,7 @@ class LegalResearchCompletenessTests(unittest.TestCase):
         evidence = server._research_evidence(AGREEMENT_URL)
         self.assertIn("статья 14", evidence["exact_sections"])
         self.assertNotIn("статья 20", evidence["exact_sections"])
+        self.assertEqual(evidence["exact_section_texts"]["статья 14"], "Текст")
 
     def test_blocks_answer_when_related_protocol_was_not_assessed(self):
         agreement = server._research_evidence(AGREEMENT_URL)
@@ -144,9 +145,112 @@ class LegalResearchCompletenessTests(unittest.TestCase):
                 "url": PROTOCOL_URL,
                 "sections": ["статья 1"],
             },
-        ])
+        ], related_assessments=[{
+            "url": PROTOCOL_URL,
+            "status": "applicable",
+            "reason": "Проверяется специальное правило о работе по найму.",
+        }])
 
         self.assertTrue(result["complete"], result["gaps"])
+
+    def test_question_checks_catch_omitted_domestic_tax_norms(self):
+        question = (
+            "Резидент РФ работает дистанционно в РФ. Правомерен ли возврат, "
+            "можно ли сделать зачет и обязан ли налоговый агент удерживать налог?"
+        )
+        tax_code = server._research_evidence(TAX_CODE_URL)
+        tax_code["revision_checked"] = True
+        tax_code["related_inspected"] = True
+        tax_code["exact_sections"] = {"статья 223", "статья 224"}
+        tax_code["exact_section_texts"] = {
+            "статья 223": (
+                "Излишне удержанный подоходный налог подлежит возврату."
+            ),
+            "статья 224": (
+                "Если международными договорами предусмотрены иные положения, "
+                "производится возврат или зачет."
+            ),
+        }
+        tax_code["document_title"] = "НАЛОГОВЫЙ КОДЕКС"
+
+        agreement = server._research_evidence(AGREEMENT_URL)
+        agreement["revision_checked"] = True
+        agreement["related_inspected"] = True
+        agreement["exact_sections"] = {"статья 14", "статья 20"}
+        agreement["exact_section_texts"] = {
+            "статья 14": "Доход может облагаться налогом в другом Государстве.",
+            "статья 20": "Сумма налога может быть вычтена из суммы налога первого Государства.",
+        }
+        agreement["document_title"] = "СОГЛАШЕНИЕ РЕСПУБЛИКА БЕЛАРУСЬ — РОССИЯ"
+        agreement["related_candidates"] = [{
+            "url": PROTOCOL_URL,
+            "title": "Протокол к соглашению",
+        }]
+
+        protocol = server._research_evidence(PROTOCOL_URL)
+        protocol["revision_checked"] = True
+        protocol["related_inspected"] = True
+        protocol["exact_sections"] = {"статья 1"}
+        protocol["exact_section_texts"] = {
+            "статья 1": "Работа по найму в другом Договаривающемся Государстве."
+        }
+        protocol["document_title"] = "ПРОТОКОЛ К СОГЛАШЕНИЮ"
+
+        requirements = [
+            {
+                "url": TAX_CODE_URL,
+                "sections": ["статья 223", "статья 224"],
+            },
+            {
+                "url": AGREEMENT_URL,
+                "sections": ["статья 14", "статья 20"],
+            },
+            {
+                "url": PROTOCOL_URL,
+                "sections": ["статья 1"],
+            },
+        ]
+        assessments = [{
+            "url": PROTOCOL_URL,
+            "status": "not_applicable",
+            "reason": "Резидент РФ работает в РФ, а не в другом государстве.",
+        }]
+
+        incomplete = server.validate_legal_research_state(
+            requirements,
+            related_assessments=assessments,
+            question=question,
+        )
+
+        self.assertFalse(incomplete["complete"])
+        self.assertTrue(any(
+            "обязанность налогового агента" in gap
+            for gap in incomplete["gaps"]
+        ))
+        self.assertTrue(any(
+            "внутренняя норма об источнике" in gap
+            for gap in incomplete["gaps"]
+        ))
+
+        tax_code["exact_sections"].update({"статья 197", "статья 216"})
+        tax_code["exact_section_texts"].update({
+            "статья 197": (
+                "Доходы, полученные от источников в Республике Беларусь, "
+                "включают вознаграждения независимо от места исполнения обязанностей."
+            ),
+            "статья 216": (
+                "Налоговый агент обязан удержать исчисленную сумму налога."
+            ),
+        })
+        requirements[0]["sections"].extend(["статья 197", "статья 216"])
+
+        complete = server.validate_legal_research_state(
+            requirements,
+            related_assessments=assessments,
+            question=question,
+        )
+
+        self.assertTrue(complete["complete"], complete["gaps"])
 
     def test_inspector_reuses_revision_checked_cache(self):
         evidence = server._research_evidence(AGREEMENT_URL)

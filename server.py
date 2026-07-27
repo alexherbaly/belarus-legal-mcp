@@ -979,11 +979,13 @@ def _research_evidence(url: str) -> dict:
     return _LEGAL_RESEARCH_EVIDENCE.setdefault(canonical, {
         "url": canonical,
         "exact_sections": set(),
+        "exact_section_texts": {},
         "document_searched": False,
         "full_text_loaded": False,
         "revision_checked": False,
         "related_inspected": False,
         "related_candidates": [],
+        "document_title": "",
     })
 
 
@@ -998,6 +1000,18 @@ def record_exact_ilex_sections(
     evidence["revision_checked"] = status in {
         "cached", "downloaded", "updated", "refreshed"
     }
+    for match in re.finditer(
+        r"(?ms)^\*\*(Статья|Пункт) "
+        rf"(\d+(?:[-{_DASHES}.]\d+)*)"
+        r"(?:, стр\. \d+)?\*\*\n"
+        r"(.*?)(?=^\s*---\s*$|\Z)",
+        result,
+    ):
+        label = "статья" if match.group(1) == "Статья" else "пункт"
+        section_id = normalize_section_id(match.group(2))
+        evidence["exact_section_texts"][
+            f"{label} {section_id}"
+        ] = match.group(3).strip()
     for locator in locators:
         try:
             canonical = canonical_section_locator(locator)
@@ -1171,6 +1185,7 @@ def validate_legal_research_state(
     requirements: list[dict],
     related_assessments: list[dict] | None = None,
     require_related_review: bool = True,
+    question: str = "",
 ) -> dict:
     """Проверяет фактическое получение норм и оценку связанных документов."""
     gaps = []
@@ -1210,15 +1225,88 @@ def validate_legal_research_state(
                     or candidate_evidence["full_text_loaded"]
                 )
             )
-            if not checked and not assessment:
+            if not assessment:
                 gaps.append(
-                    "Не оценен связанный BELAW-документ: "
+                    "Не указана применимость связанного BELAW-документа: "
                     f"{candidate.get('title') or candidate_url} ({candidate_url})"
                 )
-            elif assessment and not assessment.get("reason"):
+            elif not assessment.get("reason"):
                 warnings.append(
                     f"Для связанного документа не указано обоснование: {candidate_url}"
                 )
+            elif assessment.get("status") == "applicable" and not checked:
+                gaps.append(
+                    "Связанный документ признан применимым, но его нормы не получены: "
+                    f"{candidate_url}"
+                )
+
+    evidence_texts = []
+    titled_evidence_texts = []
+    for requirement in requirements:
+        url = canonical_ilex_document_url(requirement.get("url", ""))
+        evidence = _LEGAL_RESEARCH_EVIDENCE.get(url)
+        if not evidence:
+            continue
+        for section_text in evidence["exact_section_texts"].values():
+            evidence_texts.append(section_text)
+            titled_evidence_texts.append(
+                (evidence.get("document_title", ""), section_text)
+            )
+    combined_text = "\n".join(evidence_texts).lower()
+    question_lower = question.lower()
+
+    if re.search(r"удерж\w*\s+(?:подоходн\w+\s+)?налог|налог\w*\s+агент", question_lower):
+        has_withholding_duty = any(
+            re.search(r"налогов\w*\s+агент", text, re.IGNORECASE)
+            and re.search(r"обязан\w*.*удерж|удерж\w*.*обязан", text, re.IGNORECASE | re.DOTALL)
+            for text in evidence_texts
+        )
+        if not has_withholding_duty:
+            gaps.append(
+                "Для вопроса об удержании не получена норма, устанавливающая "
+                "обязанность налогового агента удерживать налог."
+            )
+
+    cross_border_tax = (
+        re.search(r"налог|налогооблож", question_lower)
+        and re.search(r"резидент|иностран|за предел|территори\w+\s+рф|дистанцион", question_lower)
+    )
+    if cross_border_tax:
+        has_domestic_source_rule = bool(
+            re.search(r"доход\w*.*источник\w*.*республик\w+\s+беларусь", combined_text, re.DOTALL)
+            and re.search(r"независимо\s+от\s+места", combined_text)
+        )
+        if not has_domestic_source_rule:
+            gaps.append(
+                "Для трансграничного дохода не получена внутренняя норма об "
+                "источнике дохода и влиянии места фактической работы."
+            )
+
+    if "возврат" in question_lower:
+        if not (
+            "излишне удержан" in combined_text
+            and re.search(
+                r"международн\w+\s+договор\w+.*иные\s+положения",
+                combined_text,
+                re.DOTALL,
+            )
+        ):
+            gaps.append(
+                "Для вопроса о возврате не получены одновременно нормы об "
+                "излишнем удержании и возврате по международному договору."
+            )
+
+    if re.search(r"зач[её]т", question_lower):
+        treaty_credit = any(
+            re.search(r"соглашение|конвенция|протокол", title, re.IGNORECASE)
+            and re.search(r"вычтен\w*\s+из\s+сумм\w+\s+налог", text, re.IGNORECASE)
+            for title, text in titled_evidence_texts
+        )
+        if not treaty_credit:
+            gaps.append(
+                "Для международного зачёта не получена договорная норма о "
+                "вычете налога в государстве резидентства."
+            )
     return {
         "complete": not gaps,
         "gaps": gaps,
@@ -1603,6 +1691,13 @@ async def list_tools() -> list[types.Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": (
+                            "Исходный вопрос пользователя дословно. По нему сервер "
+                            "проверяет минимальные виды необходимых доказательств."
+                        ),
+                    },
                     "requirements": {
                         "type": "array",
                         "description": "Обязательные документы и нормы для ответа",
@@ -1621,8 +1716,8 @@ async def list_tools() -> list[types.Tool]:
                     "related_assessments": {
                         "type": "array",
                         "description": (
-                            "Связанные документы, признанные неприменимыми; для каждого "
-                            "обязательно краткое обоснование"
+                            "Явная оценка каждого найденного связанного документа: "
+                            "применим или неприменим и почему"
                         ),
                         "items": {
                             "type": "object",
@@ -1630,7 +1725,10 @@ async def list_tools() -> list[types.Tool]:
                                 "url": {"type": "string"},
                                 "status": {
                                     "type": "string",
-                                    "enum": ["not_applicable", "duplicate", "future"],
+                                    "enum": [
+                                        "applicable", "not_applicable",
+                                        "duplicate", "future"
+                                    ],
                                 },
                                 "reason": {"type": "string"},
                             },
@@ -1643,7 +1741,7 @@ async def list_tools() -> list[types.Tool]:
                         "default": True,
                     },
                 },
-                "required": ["requirements"],
+                "required": ["question", "requirements"],
             },
         ),
         types.Tool(
@@ -1956,6 +2054,7 @@ async def do_inspect_ilex_document(arguments: dict) -> list[types.TextContent]:
         or (live_search_performed and not search_error)
     )
     evidence["related_candidates"] = candidates
+    evidence["document_title"] = metadata["title"]
 
     lines = [
         ilex_cache_status_note(status).strip(),
@@ -1999,6 +2098,7 @@ async def do_validate_legal_research(arguments: dict) -> list[types.TextContent]
         arguments["requirements"],
         arguments.get("related_assessments", []),
         arguments.get("require_related_review", True),
+        arguments.get("question", ""),
     )
     if result["complete"]:
         lines = [

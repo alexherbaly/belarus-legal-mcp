@@ -639,7 +639,14 @@ def cache_status_note(status: str) -> str:
     return ""
 
 
-CHROME_PROFILE_DIR = Path.home() / "Library" / "Application Support" / "Google" / "Chrome"
+import platform as _platform
+
+if _platform.system() == "Windows":
+    CHROME_PROFILE_DIR = Path.home() / "AppData" / "Local" / "Google" / "Chrome" / "User Data"
+elif _platform.system() == "Darwin":
+    CHROME_PROFILE_DIR = Path.home() / "Library" / "Application Support" / "Google" / "Chrome"
+else:
+    CHROME_PROFILE_DIR = Path.home() / ".config" / "google-chrome"
 
 
 def ilex_search_cache_path(query: str) -> Path:
@@ -708,6 +715,50 @@ def save_ilex_search_cache(
             temp_path.unlink()
         except OSError:
             pass
+
+
+_ESSENTIAL_PROFILE_FILENAMES = {"Cookies", "Cookies-journal"}
+
+
+def _copy_chrome_profile_tolerating_locks(profile_src: Path, profile_dest: Path) -> None:
+    """
+    Копирует профиль Chrome, не падая из-за некритичных файлов (Sessions,
+    Safe Browsing Cookies и т.п.), заблокированных открытым настоящим Chrome —
+    особенно часто на Windows, где такие блокировки эксклюзивны. Падаем только
+    если заблокирован сам файл сессии входа: без него авторизация ilex.by
+    невозможна, и лучше сообщить об этом явно, чем получить непонятный traceback.
+    """
+    import shutil
+
+    try:
+        shutil.copytree(
+            profile_src,
+            profile_dest,
+            ignore=shutil.ignore_patterns(
+                "SingletonLock",
+                "SingletonCookie",
+                "SingletonSocket",
+                "lockfile",
+            ),
+        )
+    except shutil.Error as exc:
+        failures = exc.args[0] if exc.args else []
+        essential_failures = [
+            item for item in failures
+            if Path(item[0]).name in _ESSENTIAL_PROFILE_FILENAMES
+        ]
+        if essential_failures:
+            locked_name = Path(essential_failures[0][0]).name
+            raise RuntimeError(
+                f"Профиль Chrome заблокирован: файл сессии входа ({locked_name}) "
+                "занят другим процессом — вероятно, у вас открыт настоящий Chrome "
+                "с тем же профилем. Закройте все окна Chrome и повторите запрос."
+            ) from exc
+        log_perf(
+            "chrome_profile_copy_nonessential_locked",
+            count=len(failures),
+            files=[Path(item[0]).name for item in failures],
+        )
 
 
 class PersistentChromeSession:
@@ -779,16 +830,7 @@ class PersistentChromeSession:
             if copied:
                 log_perf("chrome_profile_copy_method", method="apfs_clone")
             else:
-                shutil.copytree(
-                    profile_src,
-                    profile_dest,
-                    ignore=shutil.ignore_patterns(
-                        "SingletonLock",
-                        "SingletonCookie",
-                        "SingletonSocket",
-                        "lockfile",
-                    ),
-                )
+                _copy_chrome_profile_tolerating_locks(profile_src, profile_dest)
                 log_perf("chrome_profile_copy_method", method="regular")
         self._playwright = await async_playwright().start()
         with perf_stage("chrome_launch"):
@@ -1452,11 +1494,27 @@ async def get_ilex_title(url: str) -> str:
         return title
 
 
+_ANSICPG_RE = re.compile(rb"\\ansicpg(\d+)")
+
+
+def _rtf_codepage_name(raw_bytes: bytes) -> str:
+    match = _ANSICPG_RE.search(raw_bytes)
+    if not match:
+        return "cp1252"
+    return f"cp{match.group(1).decode('ascii')}"
+
+
 def rtf_to_plain_text(rtf_path: Path) -> str:
     """
     Конвертирует RTF в текст. На macOS использует встроенный textutil — он даёт
     полный и корректно структурированный текст. Библиотека striprtf (кросс-платформенный
     фолбэк) на больших документах с таблицами теряет значительную часть содержимого.
+
+    Экспорт ilex.by иногда кладёт кириллицу как сырые байты кодовой страницы,
+    заявленной в \\ansicpg (обычно 1251), а не как \\'XX-escape. Декодирование
+    таким utf-8 с errors="ignore" молча стирает всю кириллицу вместо ошибки —
+    поэтому striprtf-фолбэк декодирует по кодовой странице, указанной в самом
+    RTF-заголовке.
     """
     import platform
     import subprocess
@@ -1470,7 +1528,12 @@ def rtf_to_plain_text(rtf_path: Path) -> str:
             return result.stdout.decode("utf-8", errors="ignore")
 
     from striprtf.striprtf import rtf_to_text
-    raw = rtf_path.read_text(encoding="utf-8", errors="ignore")
+    raw_bytes = rtf_path.read_bytes()
+    codepage = _rtf_codepage_name(raw_bytes)
+    try:
+        raw = raw_bytes.decode(codepage, errors="replace")
+    except LookupError:
+        raw = raw_bytes.decode("utf-8", errors="ignore")
     return rtf_to_text(raw)
 
 

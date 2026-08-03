@@ -372,11 +372,12 @@ _ARTICLE_HEADING_RE = re.compile(
     rf"(?im)^[ \t]*статья[ \t]+(\d+(?:[-{_DASHES}]\d+)?)(?=[ \t]*(?:\.|$))"
 )
 _POINT_HEADING_RE = re.compile(
-    r"(?m)^[ \t]*(\d+(?:\.\d+)*)\.(?=[ \t]+)"
+    rf"(?m)^[ \t]*(\d+(?:(?:\.|[-{_DASHES}])\d+)*)\.(?=[ \t]+)"
 )
+STRUCTURE_INDEX_VERSION = 2
 _EXPLICIT_LOCATOR_RE = re.compile(
     rf"(?i)\b(ст(?:ать(?:я|и|ю|е|ёй|ей)|\.)|пункт(?:а|у|е|ом)?)"
-    rf"\s+(\d+(?:[-{_DASHES}.]\d+)*)"
+    rf"\s+(\d+(?:[-{_DASHES}.]\d+)*)(?:#(\d+))?"
 )
 
 
@@ -387,20 +388,29 @@ def normalize_section_id(value: str) -> str:
     return normalized.rstrip(".")
 
 
-def parse_section_locator(locator: str) -> tuple[str, str]:
-    """Возвращает (тип, номер): article, point либо auto для голого номера."""
+def parse_section_locator(locator: str) -> tuple[str, str, int | None]:
+    """Возвращает тип, номер и необязательный селектор варианта ``#N``."""
     value = locator.strip()
     explicit = _EXPLICIT_LOCATOR_RE.search(value)
     if explicit:
         kind = "article" if explicit.group(1).lower().startswith("ст") else "point"
-        return kind, normalize_section_id(explicit.group(2))
+        occurrence = int(explicit.group(3)) if explicit.group(3) else None
+        if occurrence == 0:
+            raise ValueError(f"Номер варианта должен начинаться с 1: {locator}")
+        return kind, normalize_section_id(explicit.group(2)), occurrence
 
-    section_id = normalize_section_id(value)
-    if not re.fullmatch(r"\d+(?:[-.]\d+)*", section_id):
+    bare = re.fullmatch(
+        rf"(\d+(?:[-{_DASHES}.]\d+)*)(?:#(\d+))?", value
+    )
+    if not bare:
         raise ValueError(f"Не удалось распознать структурный номер: {locator}")
+    section_id = normalize_section_id(bare.group(1))
+    occurrence = int(bare.group(2)) if bare.group(2) else None
+    if occurrence == 0:
+        raise ValueError(f"Номер варианта должен начинаться с 1: {locator}")
     if "." in section_id:
-        return "point", section_id
-    return "auto", section_id
+        return "point", section_id, occurrence
+    return "auto", section_id, occurrence
 
 
 def explicit_locators_from_query(query: str) -> list[str]:
@@ -408,10 +418,33 @@ def explicit_locators_from_query(query: str) -> list[str]:
     locators = []
     for match in _EXPLICIT_LOCATOR_RE.finditer(query):
         label = "статья" if match.group(1).lower().startswith("ст") else "пункт"
-        locator = f"{label} {normalize_section_id(match.group(2))}"
+        selector = f"#{match.group(3)}" if match.group(3) else ""
+        locator = f"{label} {normalize_section_id(match.group(2))}{selector}"
         if locator not in locators:
             locators.append(locator)
     return locators
+
+
+def _ambiguous_section_options(
+    kind: str,
+    section_id: str,
+    spans: list[tuple[int, int]],
+    text: str,
+) -> list[str]:
+    """Формирует устойчивые селекторы и краткие подсказки для вариантов."""
+    label = "статья" if kind == "article" else "пункт"
+    options = []
+    for occurrence, (start, end) in enumerate(spans, 1):
+        first_line = next(
+            (line.strip() for line in text[start:end].splitlines() if line.strip()),
+            "",
+        )
+        if len(first_line) > 140:
+            first_line = first_line[:137].rstrip() + "..."
+        options.append(
+            f"{label} {section_id}#{occurrence} — «{first_line}»"
+        )
+    return options
 
 
 def _page_offsets(pages: list[str]) -> tuple[str, list[int]]:
@@ -468,6 +501,7 @@ def build_structural_index(pages: list[str]) -> dict:
     """Строит компактный, JSON-совместимый индекс статей и пунктов документа."""
     text, page_starts = _page_offsets(pages)
     return {
+        "version": STRUCTURE_INDEX_VERSION,
         "page_starts": page_starts,
         "article": _span_index(_section_spans(text, _ARTICLE_HEADING_RE)),
         "point": _span_index(_point_spans(text)),
@@ -479,7 +513,7 @@ def cached_structural_index(cache_path: Path, pages: list[str]) -> dict:
     try:
         data = json.loads(cache_path.read_text(encoding="utf-8"))
         index = data.get("structure_index")
-        if index:
+        if index and index.get("version") == STRUCTURE_INDEX_VERSION:
             return index
         index = build_structural_index(pages)
         data["structure_index"] = index
@@ -517,11 +551,12 @@ def extract_structured_sections(
     found = []
     missing = []
     ambiguous = []
+    ambiguous_options = []
     invalid = []
     seen_spans = set()
     for locator in locators:
         try:
-            kind, section_id = parse_section_locator(locator)
+            kind, section_id, occurrence = parse_section_locator(locator)
         except ValueError:
             invalid.append(locator)
             continue
@@ -531,6 +566,12 @@ def extract_structured_sections(
         matched_kind = None
         for candidate in candidates:
             candidate_spans = span_maps[candidate].get(section_id, [])
+            if occurrence is not None:
+                if occurrence > len(candidate_spans):
+                    continue
+                span = tuple(candidate_spans[occurrence - 1])
+                matched_kind = candidate
+                break
             if len(candidate_spans) > 1:
                 if candidate == "article":
                     # В экспортированных документах ilex статья часто встречается
@@ -544,6 +585,11 @@ def extract_structured_sections(
                     matched_kind = candidate
                     break
                 ambiguous.append(locator)
+                ambiguous_options.extend(
+                    _ambiguous_section_options(
+                        candidate, section_id, candidate_spans, text
+                    )
+                )
                 span = None
                 matched_kind = None
                 break
@@ -565,6 +611,7 @@ def extract_structured_sections(
         found.append({
             "label": label,
             "section_id": section_id,
+            "occurrence": occurrence,
             "page": page_num,
             "text": text[start:end].strip(),
         })
@@ -585,8 +632,9 @@ def extract_structured_sections(
         details.append("Не найдены: " + ", ".join(missing) + ".")
     if ambiguous:
         details.append(
-            "Неоднозначные номера, уточните статью или полный номер пункта: "
-            + ", ".join(ambiguous) + "."
+            "Неоднозначные номера: " + ", ".join(ambiguous) + ". "
+            "Повторите запрос с одним из идентификаторов: "
+            + "; ".join(ambiguous_options) + "."
         )
     if invalid:
         details.append("Не распознаны: " + ", ".join(invalid) + ".")
@@ -597,8 +645,12 @@ def extract_structured_sections(
     multi_page = len({item["page"] for item in selected}) > 1
     for item in selected:
         page = f", стр. {item['page']}" if multi_page else ""
+        selector = (
+            f"#{item['occurrence']}" if item.get("occurrence") is not None else ""
+        )
         blocks.append(
-            f"**{item['label']} {item['section_id']}{page}**\n{item['text']}"
+            f"**{item['label']} {item['section_id']}{selector}{page}**\n"
+            f"{item['text']}"
         )
     if not blocks:
         return " ".join(details)
@@ -1033,12 +1085,13 @@ def canonical_ilex_document_url(url: str) -> str:
 
 def canonical_section_locator(locator: str) -> str:
     """Нормализует ссылку на норму для машинной проверки полноты."""
-    kind, section_id = parse_section_locator(locator)
+    kind, section_id, occurrence = parse_section_locator(locator)
+    selector = f"#{occurrence}" if occurrence is not None else ""
     if kind == "article":
-        return f"статья {section_id}"
+        return f"статья {section_id}{selector}"
     if kind == "point":
-        return f"пункт {section_id}"
-    return section_id
+        return f"пункт {section_id}{selector}"
+    return f"{section_id}{selector}"
 
 
 def _research_evidence(url: str) -> dict:
@@ -1083,26 +1136,35 @@ def record_exact_ilex_sections(
     for match in re.finditer(
         r"(?ms)^\*\*(Статья|Пункт) "
         rf"(\d+(?:[-{_DASHES}.]\d+)*)"
+        r"(?:#(\d+))?"
         r"(?:, стр\. \d+)?\*\*\n"
         r"(.*?)(?=^\s*---\s*$|\Z)",
         result,
     ):
         label = "статья" if match.group(1) == "Статья" else "пункт"
         section_id = normalize_section_id(match.group(2))
+        selector = f"#{match.group(3)}" if match.group(3) else ""
         evidence["exact_section_texts"][
-            f"{label} {section_id}"
-        ] = match.group(3).strip()
+            f"{label} {section_id}{selector}"
+        ] = match.group(4).strip()
     for locator in locators:
         try:
             canonical = canonical_section_locator(locator)
         except ValueError:
             continue
-        kind, section_id = parse_section_locator(locator)
+        kind, section_id, occurrence = parse_section_locator(locator)
         label = "Статья" if kind == "article" else "Пункт"
+        selector = f"#{occurrence}" if occurrence is not None else ""
         if kind == "auto":
-            pattern = rf"\*\*(?:Статья|Пункт) {re.escape(section_id)}(?:,|\*)"
+            pattern = (
+                rf"\*\*(?:Статья|Пункт) {re.escape(section_id)}"
+                rf"{re.escape(selector)}(?:,|\*)"
+            )
         else:
-            pattern = rf"\*\*{label} {re.escape(section_id)}(?:,|\*)"
+            pattern = (
+                rf"\*\*{label} {re.escape(section_id)}"
+                rf"{re.escape(selector)}(?:,|\*)"
+            )
         if re.search(pattern, result):
             evidence["exact_sections"].add(canonical)
 
@@ -1760,6 +1822,8 @@ async def list_tools() -> list[types.Tool]:
             description=(
                 "Возвращает точный полный текст указанных статей или пунктов документа ilex.by. "
                 "ВСЕГДА используй вместо search_ilex_document, когда номера структурных элементов известны. "
+                "Если один номер встречается несколько раз, ответ вернёт допустимые селекторы "
+                "вида 'пункт 1#1' и 'пункт 1#2'; повтори запрос с нужным селектором. "
                 "Можно получить несколько норм одного документа одним вызовом; реквизиты кеша и "
                 "редакции выводятся один раз."
             ),
@@ -1770,7 +1834,7 @@ async def list_tools() -> list[types.Tool]:
                     "sections": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "Например: ['статья 18', 'статья 261-3', 'пункт 21.4']"
+                        "description": "Например: ['статья 18', 'статья 261-3', 'пункт 21.4', 'пункт 1#2']"
                     },
                     "max_chars": {"type": "integer", "description": "Мягкий лимит размера ответа в символах (по умолчанию 12000)", "default": 12000},
                     "bypass_cache": {"type": "boolean", "description": "Аварийное принудительное обновление; обычно оставляй false", "default": False}

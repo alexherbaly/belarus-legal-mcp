@@ -8,6 +8,7 @@ from server import (
     explicit_locators_from_query,
     extract_structured_sections,
     ilex_cache_status_note,
+    parse_section_locator,
     search_in_pages,
     search_with_structural_preference,
 )
@@ -88,6 +89,22 @@ class StructuredRetrievalTests(unittest.TestCase):
         self.assertNotIn("Приказы о приеме", result)
         self.assertNotIn("Иные приказы", result)
 
+    def test_point_stops_before_hyphenated_sibling(self):
+        pages = [
+            """1. Основное правило.
+
+Продолжение основного правила.
+
+1-1. Самостоятельное специальное правило.
+
+2. Следующее правило."""
+        ]
+
+        result = extract_structured_sections(pages, ["пункт 1"])
+
+        self.assertIn("Продолжение основного правила", result)
+        self.assertNotIn("Самостоятельное специальное правило", result)
+
     def test_recognizes_explicit_locators_and_unicode_dash(self):
         locators = explicit_locators_from_query(
             "Найди статью 18, пункт 21.4 и ст. 261‑3"
@@ -144,7 +161,7 @@ class StructuredRetrievalTests(unittest.TestCase):
         self.assertIn("пропущено по лимиту размера", result)
         self.assertLess(result.count("редкий термин"), 3)
 
-    def test_rejects_ambiguous_point_number(self):
+    def test_ambiguous_point_number_returns_selectable_candidates(self):
         pages = [
             """Статья 1. Первая
 
@@ -157,8 +174,45 @@ class StructuredRetrievalTests(unittest.TestCase):
         result = extract_structured_sections(pages, ["пункт 1"])
 
         self.assertIn("Неоднозначные номера", result)
-        self.assertNotIn("Первый пункт", result)
-        self.assertNotIn("Другой первый пункт", result)
+        self.assertIn("пункт 1#1", result)
+        self.assertIn("пункт 1#2", result)
+        self.assertIn("Первый пункт", result)
+        self.assertIn("Другой первый пункт", result)
+
+    def test_selects_specific_ambiguous_point_by_occurrence(self):
+        pages = [
+            """ПРИКАЗЫВАЮ:
+
+1. Установить перечень государств.
+
+2. Утвердить Положение.
+
+ПОЛОЖЕНИЕ
+
+1. Настоящее Положение определяет порядок.
+
+2. Для целей Положения используются термины."""
+        ]
+
+        first = extract_structured_sections(pages, ["пункт 1#1"])
+        second = extract_structured_sections(pages, ["пункт 1#2"])
+
+        self.assertIn("**Пункт 1#1**", first)
+        self.assertIn("Установить перечень", first)
+        self.assertNotIn("Настоящее Положение", first)
+        self.assertIn("**Пункт 1#2**", second)
+        self.assertIn("Настоящее Положение", second)
+        self.assertNotIn("Установить перечень", second)
+
+    def test_parses_occurrence_selector_from_explicit_locator(self):
+        self.assertEqual(
+            parse_section_locator("пункт 1#2"),
+            ("point", "1", 2),
+        )
+        self.assertEqual(
+            explicit_locators_from_query("получи пункт 1#2 и статью 4"),
+            ["пункт 1#2", "статья 4"],
+        )
 
     def test_prefers_full_article_over_table_of_contents_entry(self):
         pages = [

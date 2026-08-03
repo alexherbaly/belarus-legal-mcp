@@ -12,6 +12,7 @@ import server
 AGREEMENT_URL = "https://ilex-private.ilex.by/view-document/BELAW/13142/"
 PROTOCOL_URL = "https://ilex-private.ilex.by/view-document/BELAW/74991/"
 TAX_CODE_URL = "https://ilex-private.ilex.by/view-document/BELAW/198143/"
+ORDER_URL = "https://ilex-private.ilex.by/view-document/BELAW/203783/"
 
 AGREEMENT_TEXT = """
 СОГЛАШЕНИЕ МЕЖДУ ПРАВИТЕЛЬСТВОМ РЕСПУБЛИКИ БЕЛАРУСЬ И
@@ -90,6 +91,33 @@ class LegalResearchCompletenessTests(unittest.TestCase):
         self.assertIn("статья 14", evidence["exact_sections"])
         self.assertNotIn("статья 20", evidence["exact_sections"])
         self.assertEqual(evidence["exact_section_texts"]["статья 14"], "Текст")
+
+    def test_records_and_validates_selected_ambiguous_point(self):
+        result = (
+            "Извлечено структурных элементов: 1.\n\n"
+            "---\n\n**Пункт 1#1**\n1. Установить перечень государств."
+        )
+
+        server.record_exact_ilex_sections(
+            ORDER_URL,
+            ["пункт 1#1"],
+            result,
+            "cached",
+        )
+        evidence = server._research_evidence(ORDER_URL)
+        evidence["related_inspected"] = True
+
+        validation = server.validate_legal_research_state([{
+            "url": ORDER_URL,
+            "sections": ["пункт 1#1"],
+        }])
+
+        self.assertIn("пункт 1#1", evidence["exact_sections"])
+        self.assertEqual(
+            evidence["exact_section_texts"]["пункт 1#1"],
+            "1. Установить перечень государств.",
+        )
+        self.assertTrue(validation["complete"])
 
     def test_blocks_answer_when_related_protocol_was_not_assessed(self):
         agreement = server._research_evidence(AGREEMENT_URL)

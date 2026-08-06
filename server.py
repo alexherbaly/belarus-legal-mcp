@@ -770,47 +770,67 @@ def save_ilex_search_cache(
 
 
 _ESSENTIAL_PROFILE_FILENAMES = {"Cookies", "Cookies-journal"}
+_ESSENTIAL_LOCK_RETRIES = 5
+_ESSENTIAL_LOCK_RETRY_DELAY_SECONDS = 0.3
 
 
 def _copy_chrome_profile_tolerating_locks(profile_src: Path, profile_dest: Path) -> None:
     """
     Копирует профиль Chrome, не падая из-за некритичных файлов (Sessions,
     Safe Browsing Cookies и т.п.), заблокированных открытым настоящим Chrome —
-    особенно часто на Windows, где такие блокировки эксклюзивны. Падаем только
-    если заблокирован сам файл сессии входа: без него авторизация ilex.by
-    невозможна, и лучше сообщить об этом явно, чем получить непонятный traceback.
+    особенно часто на Windows, где такие блокировки эксклюзивны. Пользователи не
+    должны закрывать свой рабочий Chrome ради MCP-сервера, поэтому при блокировке
+    файла сессии входа (Cookies) несколько раз кратко повторяем копирование —
+    Chrome держит его залоченным только на момент checkpoint/записи, а не постоянно.
+    Падаем лишь если файл остаётся заблокированным после всех попыток.
     """
     import shutil
+    import time
 
-    try:
-        shutil.copytree(
-            profile_src,
-            profile_dest,
-            ignore=shutil.ignore_patterns(
-                "SingletonLock",
-                "SingletonCookie",
-                "SingletonSocket",
-                "lockfile",
-            ),
-        )
-    except shutil.Error as exc:
-        failures = exc.args[0] if exc.args else []
-        essential_failures = [
-            item for item in failures
-            if Path(item[0]).name in _ESSENTIAL_PROFILE_FILENAMES
-        ]
-        if essential_failures:
+    last_exc: shutil.Error | None = None
+    for attempt in range(_ESSENTIAL_LOCK_RETRIES):
+        try:
+            shutil.copytree(
+                profile_src,
+                profile_dest,
+                ignore=shutil.ignore_patterns(
+                    "SingletonLock",
+                    "SingletonCookie",
+                    "SingletonSocket",
+                    "lockfile",
+                ),
+                dirs_exist_ok=True,
+            )
+        except shutil.Error as exc:
+            failures = exc.args[0] if exc.args else []
+            essential_failures = [
+                item for item in failures
+                if Path(item[0]).name in _ESSENTIAL_PROFILE_FILENAMES
+            ]
+            if not essential_failures:
+                log_perf(
+                    "chrome_profile_copy_nonessential_locked",
+                    count=len(failures),
+                    files=[Path(item[0]).name for item in failures],
+                )
+                return
+            last_exc = exc
+            log_perf(
+                "chrome_profile_copy_essential_locked_retry",
+                attempt=attempt,
+                locked_name=Path(essential_failures[0][0]).name,
+            )
+            if attempt < _ESSENTIAL_LOCK_RETRIES - 1:
+                time.sleep(_ESSENTIAL_LOCK_RETRY_DELAY_SECONDS)
+                continue
             locked_name = Path(essential_failures[0][0]).name
             raise RuntimeError(
                 f"Профиль Chrome заблокирован: файл сессии входа ({locked_name}) "
-                "занят другим процессом — вероятно, у вас открыт настоящий Chrome "
-                "с тем же профилем. Закройте все окна Chrome и повторите запрос."
+                "занят другим процессом. Обычно это временно (например, Chrome "
+                "как раз сохраняет куки) — повторите запрос ещё раз."
             ) from exc
-        log_perf(
-            "chrome_profile_copy_nonessential_locked",
-            count=len(failures),
-            files=[Path(item[0]).name for item in failures],
-        )
+        else:
+            return
 
 
 class PersistentChromeSession:

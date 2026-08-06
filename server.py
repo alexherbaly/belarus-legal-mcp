@@ -769,68 +769,81 @@ def save_ilex_search_cache(
             pass
 
 
-_ESSENTIAL_PROFILE_FILENAMES = {"Cookies", "Cookies-journal"}
-_ESSENTIAL_LOCK_RETRIES = 5
-_ESSENTIAL_LOCK_RETRY_DELAY_SECONDS = 0.3
+_COOKIES_DB_FILENAMES = {"Cookies", "Cookies-journal", "Cookies-wal", "Cookies-shm"}
+_COOKIES_DB_BACKUP_TIMEOUT_SECONDS = 10
+
+
+def _copy_cookies_db_live(profile_src: Path, profile_dest: Path) -> None:
+    """
+    Копирует Cookies через SQLite Online Backup API вместо копирования файла на
+    уровне ОС. Chrome хранит Cookies в режиме WAL, который штатно поддерживает
+    параллельных читателей во время записи — обычный shutil.copy же требует
+    целиком свободного файла и падает с "занят другим процессом" на Windows,
+    где блокировка эксклюзивна, даже если Chrome в этот момент почти не пишет.
+    sqlite3 сам ждёт освобождения блокировки в пределах timeout, что надёжнее
+    ручных повторов с паузой.
+    """
+    import sqlite3
+
+    src_path = profile_src / "Cookies"
+    if not src_path.exists():
+        return
+    dest_path = profile_dest / "Cookies"
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+
+    src_uri = f"file:{src_path.as_posix()}?mode=ro"
+    src_conn = sqlite3.connect(
+        src_uri, uri=True, timeout=_COOKIES_DB_BACKUP_TIMEOUT_SECONDS
+    )
+    try:
+        dest_conn = sqlite3.connect(str(dest_path))
+        try:
+            src_conn.backup(dest_conn)
+        finally:
+            dest_conn.close()
+    except sqlite3.OperationalError as exc:
+        raise RuntimeError(
+            "Профиль Chrome заблокирован: не удалось прочитать файл сессии "
+            "входа (Cookies) — вероятно, Chrome в этот момент активно "
+            "записывает в него. Повторите запрос ещё раз."
+        ) from exc
+    finally:
+        src_conn.close()
 
 
 def _copy_chrome_profile_tolerating_locks(profile_src: Path, profile_dest: Path) -> None:
     """
     Копирует профиль Chrome, не падая из-за некритичных файлов (Sessions,
     Safe Browsing Cookies и т.п.), заблокированных открытым настоящим Chrome —
-    особенно часто на Windows, где такие блокировки эксклюзивны. Пользователи не
-    должны закрывать свой рабочий Chrome ради MCP-сервера, поэтому при блокировке
-    файла сессии входа (Cookies) несколько раз кратко повторяем копирование —
-    Chrome держит его залоченным только на момент checkpoint/записи, а не постоянно.
-    Падаем лишь если файл остаётся заблокированным после всех попыток.
+    особенно часто на Windows, где такие блокировки эксклюзивны. Файлы БД cookies
+    исключены из этого сырого копирования и переносятся отдельно, через
+    _copy_cookies_db_live — единственный способ, надёжно работающий, пока
+    настоящий Chrome открыт.
     """
     import shutil
-    import time
 
-    last_exc: shutil.Error | None = None
-    for attempt in range(_ESSENTIAL_LOCK_RETRIES):
-        try:
-            shutil.copytree(
-                profile_src,
-                profile_dest,
-                ignore=shutil.ignore_patterns(
-                    "SingletonLock",
-                    "SingletonCookie",
-                    "SingletonSocket",
-                    "lockfile",
-                ),
-                dirs_exist_ok=True,
-            )
-        except shutil.Error as exc:
-            failures = exc.args[0] if exc.args else []
-            essential_failures = [
-                item for item in failures
-                if Path(item[0]).name in _ESSENTIAL_PROFILE_FILENAMES
-            ]
-            if not essential_failures:
-                log_perf(
-                    "chrome_profile_copy_nonessential_locked",
-                    count=len(failures),
-                    files=[Path(item[0]).name for item in failures],
-                )
-                return
-            last_exc = exc
-            log_perf(
-                "chrome_profile_copy_essential_locked_retry",
-                attempt=attempt,
-                locked_name=Path(essential_failures[0][0]).name,
-            )
-            if attempt < _ESSENTIAL_LOCK_RETRIES - 1:
-                time.sleep(_ESSENTIAL_LOCK_RETRY_DELAY_SECONDS)
-                continue
-            locked_name = Path(essential_failures[0][0]).name
-            raise RuntimeError(
-                f"Профиль Chrome заблокирован: файл сессии входа ({locked_name}) "
-                "занят другим процессом. Обычно это временно (например, Chrome "
-                "как раз сохраняет куки) — повторите запрос ещё раз."
-            ) from exc
-        else:
-            return
+    try:
+        shutil.copytree(
+            profile_src,
+            profile_dest,
+            ignore=shutil.ignore_patterns(
+                "SingletonLock",
+                "SingletonCookie",
+                "SingletonSocket",
+                "lockfile",
+                *_COOKIES_DB_FILENAMES,
+            ),
+            dirs_exist_ok=True,
+        )
+    except shutil.Error as exc:
+        failures = exc.args[0] if exc.args else []
+        log_perf(
+            "chrome_profile_copy_nonessential_locked",
+            count=len(failures),
+            files=[Path(item[0]).name for item in failures],
+        )
+
+    _copy_cookies_db_live(profile_src, profile_dest)
 
 
 class PersistentChromeSession:

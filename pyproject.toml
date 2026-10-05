@@ -15,7 +15,6 @@ dependencies = [
     "playwright>=1.40",
     "pymorphy3>=2.0",
     "pypdf>=4.0",
-    "striprtf>=0.0.26",
 ]
 
 [tool.setuptools]

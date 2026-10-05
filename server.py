@@ -1,14 +1,16 @@
 import asyncio
 import contextvars
+import html
 import io
 import hashlib
 import json
 import math
+import os
 import re
 import time
 import uuid
 from bisect import bisect_right
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from mcp.server import Server
@@ -27,7 +29,9 @@ HEADERS = {
 PDF_CACHE_DIR = Path.home() / ".claude" / "mcp_servers" / "pdf_cache"
 PDF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-ILEX_CACHE_DIR = Path.home() / ".claude" / "mcp_servers" / "ilex_cache"
+# Отдельная папка от прежнего ilex_cache: там лежат тексты, полученные
+# экспортом RTF через Chrome, — с текстом из API их смешивать нельзя.
+ILEX_CACHE_DIR = Path.home() / ".claude" / "mcp_servers" / "ilex_api_cache"
 ILEX_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 ILEX_SEARCH_CACHE_DIR = (
@@ -691,14 +695,266 @@ def cache_status_note(status: str) -> str:
     return ""
 
 
-import platform as _platform
+ILEX_WEB_BASE_URL = "https://ilex-private.ilex.by"
+ILEX_API_BASE_URL = os.environ.get(
+    "ILEX_API_BASE_URL", f"{ILEX_WEB_BASE_URL}/backend-client/api/v1"
+).rstrip("/")
+ILEX_API_TIMEOUT_SECONDS = 90
+ILEX_SEARCH_MAX_QUERY_CHARS = 255
+ILEX_SEARCH_MAX_RESULTS = 10
+# Ключ поисковой выдачи версионируется, чтобы не подхватить из кеша результаты,
+# полученные ещё скрапингом страницы через Chrome.
+ILEX_SEARCH_CACHE_KEY_PREFIX = "api-v1"
+# Повторная проверка через documents/history нужна не чаще, чем раз в несколько
+# минут: в одном исследовании модель обращается к одному документу много раз.
+ILEX_REVISION_CHECK_INTERVAL_SECONDS = 10 * 60
+ILEX_DOCUMENT_CACHE_VERSION = 4
+# Максимальная разница дат from/to, которую принимает documents/history
+# (строго меньше 7 дней), минус запас на смену суток.
+ILEX_HISTORY_MAX_DAYS = 6
+_ILEX_CREDENTIALS_HINT = (
+    "Укажите ILEX_USERNAME и ILEX_PASSWORD в блоке \"env\" конфигурации "
+    "MCP-сервера в Claude Desktop или в файле .env рядом с server.py."
+)
 
-if _platform.system() == "Windows":
-    CHROME_PROFILE_DIR = Path.home() / "AppData" / "Local" / "Google" / "Chrome" / "User Data"
-elif _platform.system() == "Darwin":
-    CHROME_PROFILE_DIR = Path.home() / "Library" / "Application Support" / "Google" / "Chrome"
-else:
-    CHROME_PROFILE_DIR = Path.home() / ".config" / "google-chrome"
+
+ILEX_API_ATTEMPTS = 3
+ILEX_API_RETRY_DELAY_SECONDS = 2.0
+ILEX_API_MAX_RETRY_DELAY_SECONDS = 10.0
+ILEX_API_RETRY_STATUSES = {429, 502, 503, 504, 509}
+
+
+def _ilex_retry_delay(response, attempt: int) -> float:
+    try:
+        delay = float(response.headers.get("Retry-After", ""))
+    except ValueError:
+        delay = ILEX_API_RETRY_DELAY_SECONDS * (attempt + 1)
+    return max(0.0, min(delay, ILEX_API_MAX_RETRY_DELAY_SECONDS))
+
+
+class IlexApiError(Exception):
+    """Ошибка API ilex с сообщением, пригодным для показа модели."""
+
+    def __init__(self, message: str, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def load_dotenv_values(path: Path) -> dict[str, str]:
+    """Читает простой KEY=VALUE .env без отдельной зависимости."""
+    values: dict[str, str] = {}
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return values
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if key.startswith("export "):
+            key = key[len("export "):].strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        values[key] = value
+    return values
+
+
+def ilex_credentials() -> tuple[str, str]:
+    """Переменные окружения важнее .env: так конфиг Claude Desktop всегда главный."""
+    file_values = load_dotenv_values(Path(__file__).with_name(".env"))
+    username = os.environ.get("ILEX_USERNAME") or file_values.get("ILEX_USERNAME", "")
+    password = os.environ.get("ILEX_PASSWORD") or file_values.get("ILEX_PASSWORD", "")
+    if not username or not password:
+        raise IlexApiError(
+            "Не заданы учётные данные API ilex. " + _ILEX_CREDENTIALS_HINT
+        )
+    return username, password
+
+
+def _ilex_error_detail(response) -> str:
+    try:
+        data = response.json()
+    except ValueError:
+        return response.text.strip()[:300]
+    if isinstance(data, dict):
+        for key in ("message", "error", "detail", "title"):
+            if data.get(key):
+                return str(data[key])[:300]
+    return json.dumps(data, ensure_ascii=False)[:300]
+
+
+def ilex_api_error(response, action: str) -> IlexApiError:
+    status = response.status_code
+    if status == 400:
+        reason = "некорректный запрос"
+    elif status == 401:
+        reason = (
+            "авторизация отклонена (неверные учётные данные, аккаунт "
+            "заблокирован или нет активной подписки)"
+        )
+    elif status == 403:
+        reason = (
+            "нет доступа (аккаунт заблокирован, к аккаунту не подключено API "
+            "или документ не входит в разделы подписки)"
+        )
+    elif status == 404:
+        reason = "не найдено"
+    elif status in {429, 509}:
+        reason = "превышен лимит частоты запросов, повторите позже"
+    else:
+        reason = f"HTTP {status}"
+    detail = _ilex_error_detail(response)
+    message = f"API ilex: {action} — {reason}"
+    if detail:
+        message += f". Ответ сервера: {detail}"
+    if status == 401:
+        message += ". " + _ILEX_CREDENTIALS_HINT
+    return IlexApiError(message, status)
+
+
+class IlexApiClient:
+    """
+    Клиент официального API ilex (backend-client). Токен получается лениво при
+    первом обращении и обновляется один раз при ответе 401 — срок жизни токена
+    API не документирован.
+    """
+
+    def __init__(self, base_url: str = ILEX_API_BASE_URL) -> None:
+        self._base_url = base_url
+        self._client = None
+        self._token: str | None = None
+        self._auth_lock = asyncio.Lock()
+
+    def _http(self):
+        if self._client is None:
+            import httpx
+
+            self._client = httpx.AsyncClient(
+                base_url=self._base_url,
+                timeout=ILEX_API_TIMEOUT_SECONDS,
+                headers={"Accept": "application/json"},
+            )
+        return self._client
+
+    async def _send(self, method: str, path: str, **kwargs):
+        """
+        Повторяет запрос при сетевой ошибке, недоступности шлюза и ограничении
+        частоты (API ilex отвечает 509 на серию быстрых запросов).
+        """
+        import httpx
+
+        for attempt in range(ILEX_API_ATTEMPTS):
+            last_attempt = attempt == ILEX_API_ATTEMPTS - 1
+            try:
+                response = await self._http().request(method, path, **kwargs)
+            except httpx.TransportError as exc:
+                if last_attempt:
+                    raise IlexApiError(f"API ilex недоступно: {exc}") from exc
+                await asyncio.sleep(ILEX_API_RETRY_DELAY_SECONDS * (attempt + 1))
+                continue
+            if response.status_code in ILEX_API_RETRY_STATUSES and not last_attempt:
+                log_perf("ilex_api_retry", status_code=response.status_code)
+                await asyncio.sleep(_ilex_retry_delay(response, attempt))
+                continue
+            return response
+        raise IlexApiError("API ilex недоступно.")
+
+    async def _authenticate(self, stale_token: str | None) -> str:
+        async with self._auth_lock:
+            # Пока этот вызов ждал блокировку, токен мог обновить другой вызов.
+            if self._token and self._token != stale_token:
+                return self._token
+            username, password = ilex_credentials()
+            with perf_stage("ilex_api_authenticate"):
+                response = await self._send(
+                    "POST",
+                    "/authenticate",
+                    json={"username": username, "password": password},
+                )
+            if response.status_code != 200:
+                raise ilex_api_error(response, "получение токена")
+            try:
+                token = response.json().get("token")
+            except (ValueError, AttributeError):
+                token = None
+            if not token:
+                raise IlexApiError("API ilex не вернуло токен авторизации.")
+            self._token = token
+            return token
+
+    async def request_json(self, method: str, path: str, action: str, **kwargs):
+        token = self._token or await self._authenticate(None)
+        response = await self._send(
+            method, path, headers={"x-auth-token": token}, **kwargs
+        )
+        if response.status_code == 401:
+            token = await self._authenticate(token)
+            response = await self._send(
+                method, path, headers={"x-auth-token": token}, **kwargs
+            )
+        if response.status_code != 200:
+            raise ilex_api_error(response, action)
+        try:
+            return response.json()
+        except ValueError as exc:
+            raise IlexApiError(
+                f"API ilex: {action} — ответ не является JSON."
+            ) from exc
+
+    async def search_documents(self, query: str, category: str | None = None) -> dict:
+        payload = {"query": query}
+        if category:
+            payload["category"] = category
+        with perf_stage("ilex_api_search"):
+            return await self.request_json(
+                "POST", "/search/documents", "поиск документов", json=payload
+            )
+
+    async def search_categories(self) -> list[dict]:
+        data = await self.request_json(
+            "GET", "/search/categories", "получение категорий поиска"
+        )
+        categories = data.get("categories", []) if isinstance(data, dict) else []
+        return [item for item in categories if isinstance(item, dict)]
+
+    async def get_document(self, infobank: str, doc_id: int) -> dict:
+        with perf_stage("ilex_api_document"):
+            return await self.request_json(
+                "GET",
+                f"/documents/{infobank}/{doc_id}",
+                f"получение документа {infobank}/{doc_id}",
+            )
+
+    async def document_history(
+        self,
+        date_from: str,
+        date_to: str,
+        infobanks: list[str] | None = None,
+        docs: list[int] | None = None,
+    ) -> dict:
+        params: dict = {"from": date_from, "to": date_to}
+        if infobanks:
+            params["infobanks"] = infobanks
+        if docs:
+            params["docs"] = docs
+        with perf_stage("ilex_api_history"):
+            return await self.request_json(
+                "GET",
+                "/documents/history",
+                "проверка обновлений документов",
+                params=params,
+            )
+
+    async def close(self) -> None:
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None
+
+
+ILEX_API = IlexApiClient()
 
 
 def ilex_search_cache_path(query: str) -> Path:
@@ -741,6 +997,18 @@ def load_ilex_search_cache(
     return None
 
 
+def write_json_atomic(path: Path, data: dict) -> None:
+    temp_path = path.with_suffix(f".{uuid.uuid4().hex}.tmp")
+    try:
+        temp_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        temp_path.replace(path)
+    except OSError:
+        try:
+            temp_path.unlink()
+        except OSError:
+            pass
+
+
 def save_ilex_search_cache(
     query: str,
     max_results: int,
@@ -749,371 +1017,179 @@ def save_ilex_search_cache(
     """Атомарно кеширует выдачу; сам пользовательский запрос не сохраняется."""
     if not results:
         return
-    cache_path = ilex_search_cache_path(query)
-    temp_path = cache_path.with_suffix(f".{uuid.uuid4().hex}.tmp")
-    data = {
+    write_json_atomic(ilex_search_cache_path(query), {
         "cached_at": time.time(),
         "max_results": max_results,
         "results": results,
-    }
-    try:
-        temp_path.write_text(
-            json.dumps(data, ensure_ascii=False),
-            encoding="utf-8",
-        )
-        temp_path.replace(cache_path)
-    except OSError:
-        try:
-            temp_path.unlink()
-        except OSError:
-            pass
+    })
 
 
-_COOKIES_DB_FILENAMES = {"Cookies", "Cookies-journal", "Cookies-wal", "Cookies-shm"}
-_COOKIES_DB_BACKUP_TIMEOUT_SECONDS = 10
+_ILEX_LINK_RE = re.compile(r"\{[СC][СC]_([^{}]*)\}(.*?)\{[КK][СC][СC]\}", re.DOTALL)
+_ILEX_LINKED_DOCUMENT_RE = re.compile(r"\[([A-Z]+)/(\d+)\]")
+_ILEX_HTML_LINK_RE = re.compile(
+    r"<document-link\b([^>]*)>(.*?)</document-link>", re.DOTALL | re.IGNORECASE
+)
+_ILEX_HTML_ADDITIONAL_LINK_RE = re.compile(
+    r"<document-additional-link\b[^>]*>(?:.*?</document-additional-link>)?",
+    re.DOTALL | re.IGNORECASE,
+)
+_ILEX_HTML_BREAK_RE = re.compile(r"<br\s*/?>|</p\s*>|</div\s*>|</li\s*>", re.IGNORECASE)
+# Только известные теги: в тексте норм встречаются знаки «<» и «>» как
+# математические, и общий <[^>]+> мог бы съесть часть нормы.
+_ILEX_HTML_TAG_RE = re.compile(
+    r"</?(?:p|br|div|span|em|strong|b|i|u|sup|sub|a|ul|ol|li|font|"
+    r"document-[a-z-]+)\b[^>]*>",
+    re.IGNORECASE,
+)
 
 
-def _copy_cookies_db_live(profile_src: Path, profile_dest: Path) -> None:
+def _ilex_link_label(label: str, infobank: str | None, doc_id: str | None) -> str:
+    if infobank and doc_id:
+        return f"{label} [{infobank.upper()}/{doc_id}]"
+    return label
+
+
+def clean_ilex_markup(text: str) -> str:
     """
-    Копирует Cookies через SQLite Online Backup API вместо копирования файла на
-    уровне ОС. Chrome хранит Cookies в режиме WAL, который штатно поддерживает
-    параллельных читателей во время записи — обычный shutil.copy же требует
-    целиком свободного файла и падает с "занят другим процессом" на Windows,
-    где блокировка эксклюзивна, даже если Chrome в этот момент почти не пишет.
-    sqlite3 сам ждёт освобождения блокировки в пределах timeout, что надёжнее
-    ручных повторов с паузой.
+    Убирает служебную разметку ilex: HTML справки (<p>, <em>, <document-link
+    infobank="BELAW" doc-id="219162">Законом</document-link>) и текстовые
+    ссылки вида {СС_НУЛ_Б=BELAW_Д=175777_М=100011}постановления{КСС}. Ссылки
+    на другие документы сохраняются компактной меткой [BELAW/175777] — её
+    понимают все ilex-инструменты как адрес документа; ссылки внутри
+    документа превращаются в обычный текст.
     """
-    import sqlite3
+    text = text or ""
 
-    src_path = profile_src / "Cookies"
-    if not src_path.exists():
-        return
-    dest_path = profile_dest / "Cookies"
-    dest_path.parent.mkdir(parents=True, exist_ok=True)
-
-    src_uri = f"file:{src_path.as_posix()}?mode=ro"
-    src_conn = sqlite3.connect(
-        src_uri, uri=True, timeout=_COOKIES_DB_BACKUP_TIMEOUT_SECONDS
-    )
-    try:
-        dest_conn = sqlite3.connect(str(dest_path))
-        try:
-            src_conn.backup(dest_conn)
-        finally:
-            dest_conn.close()
-    except sqlite3.OperationalError as exc:
-        raise RuntimeError(
-            "Профиль Chrome заблокирован: не удалось прочитать файл сессии "
-            "входа (Cookies) — вероятно, Chrome в этот момент активно "
-            "записывает в него. Повторите запрос ещё раз."
-        ) from exc
-    finally:
-        src_conn.close()
-
-
-def _copy_chrome_profile_tolerating_locks(profile_src: Path, profile_dest: Path) -> None:
-    """
-    Копирует профиль Chrome, не падая из-за некритичных файлов (Sessions,
-    Safe Browsing Cookies и т.п.), заблокированных открытым настоящим Chrome —
-    особенно часто на Windows, где такие блокировки эксклюзивны. Файлы БД cookies
-    исключены из этого сырого копирования и переносятся отдельно, через
-    _copy_cookies_db_live — единственный способ, надёжно работающий, пока
-    настоящий Chrome открыт.
-    """
-    import shutil
-
-    try:
-        shutil.copytree(
-            profile_src,
-            profile_dest,
-            ignore=shutil.ignore_patterns(
-                "SingletonLock",
-                "SingletonCookie",
-                "SingletonSocket",
-                "lockfile",
-                *_COOKIES_DB_FILENAMES,
-            ),
-            dirs_exist_ok=True,
-        )
-    except shutil.Error as exc:
-        failures = exc.args[0] if exc.args else []
-        log_perf(
-            "chrome_profile_copy_nonessential_locked",
-            count=len(failures),
-            files=[Path(item[0]).name for item in failures],
+    def replace_text_link(match: re.Match) -> str:
+        params, label = match.group(1), match.group(2)
+        infobank = re.search(r"Б=([A-Za-z]+)", params)
+        doc_id = re.search(r"Д=(\d+)", params)
+        return _ilex_link_label(
+            label,
+            infobank.group(1) if infobank else None,
+            doc_id.group(1) if doc_id else None,
         )
 
-    _copy_cookies_db_live(profile_src, profile_dest)
+    def replace_html_link(match: re.Match) -> str:
+        attributes, label = match.group(1), match.group(2)
+        infobank = re.search(r'infobank="([A-Za-z]+)"', attributes)
+        doc_id = re.search(r'doc-id="(\d+)"', attributes)
+        return _ilex_link_label(
+            _ILEX_HTML_TAG_RE.sub("", label),
+            infobank.group(1) if infobank else None,
+            doc_id.group(1) if doc_id else None,
+        )
+
+    text = _ILEX_LINK_RE.sub(replace_text_link, text)
+    if _ILEX_HTML_TAG_RE.search(text):
+        text = _ILEX_HTML_ADDITIONAL_LINK_RE.sub("", text)
+        text = _ILEX_HTML_LINK_RE.sub(replace_html_link, text)
+        text = _ILEX_HTML_BREAK_RE.sub("\n", text)
+        text = html.unescape(_ILEX_HTML_TAG_RE.sub("", text))
+        text = "\n".join(line.strip() for line in text.splitlines())
+        text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return text
 
 
-class PersistentChromeSession:
-    """Одна авторизованная Chrome-сессия на весь срок жизни MCP-процесса."""
-
-    def __init__(self) -> None:
-        self._lock = asyncio.Lock()
-        self._playwright = None
-        self._context = None
-        self._profile_dir: Path | None = None
-
-    def _is_connected(self) -> bool:
-        if self._context is None:
-            return False
-        try:
-            browser = self._context.browser
-            return browser is not None and browser.is_connected()
-        except Exception:
-            return False
-
-    async def _close_unlocked(self) -> None:
-        import shutil
-
-        if self._context is not None:
-            try:
-                await self._context.close()
-            except Exception:
-                pass
-            self._context = None
-        if self._playwright is not None:
-            try:
-                await self._playwright.stop()
-            except Exception:
-                pass
-            self._playwright = None
-        if self._profile_dir is not None:
-            shutil.rmtree(self._profile_dir, ignore_errors=True)
-            self._profile_dir = None
-
-    async def _ensure_started_unlocked(self) -> None:
-        import platform
-        import shutil
-        import subprocess
-        import tempfile
-        from playwright.async_api import async_playwright
-
-        if self._is_connected():
-            log_perf("browser_reused")
-            return
-
-        await self._close_unlocked()
-        self._profile_dir = Path(tempfile.mkdtemp())
-        with perf_stage("chrome_profile_copy"):
-            profile_src = CHROME_PROFILE_DIR / "Default"
-            profile_dest = self._profile_dir / "Default"
-            copied = False
-            if platform.system() == "Darwin":
-                try:
-                    result = subprocess.run(
-                        ["/bin/cp", "-cR", str(profile_src), str(profile_dest)],
-                        capture_output=True,
-                        timeout=30,
-                    )
-                    copied = result.returncode == 0
-                except (OSError, subprocess.TimeoutExpired):
-                    copied = False
-                if not copied:
-                    shutil.rmtree(profile_dest, ignore_errors=True)
-            if copied:
-                log_perf("chrome_profile_copy_method", method="apfs_clone")
-            else:
-                _copy_chrome_profile_tolerating_locks(profile_src, profile_dest)
-                log_perf("chrome_profile_copy_method", method="regular")
-        self._playwright = await async_playwright().start()
-        with perf_stage("chrome_launch"):
-            self._context = await self._playwright.chromium.launch_persistent_context(
-                user_data_dir=str(self._profile_dir),
-                channel="chrome",
-                headless=True,
-                args=["--profile-directory=Default"],
-                accept_downloads=True,
-            )
-
-    @asynccontextmanager
-    async def page(self):
-        """
-        Сериализует операции ilex: сайт и профиль стабильнее работают с одной
-        вкладкой за раз, а LLM обычно всё равно вызывает инструменты последовательно.
-        """
-        async with self._lock:
-            await self._ensure_started_unlocked()
-            page = await self._context.new_page()
-            try:
-                yield page
-            finally:
-                try:
-                    await page.close()
-                except Exception:
-                    pass
-                if not self._is_connected():
-                    await self._close_unlocked()
-
-    async def close(self) -> None:
-        async with self._lock:
-            await self._close_unlocked()
+def ilex_linked_documents(text: str) -> list[tuple[str, int]]:
+    """Возвращает документы, на которые ссылается очищенный текст, без повторов."""
+    refs = []
+    for match in _ILEX_LINKED_DOCUMENT_RE.finditer(text or ""):
+        ref = (match.group(1), int(match.group(2)))
+        if ref not in refs:
+            refs.append(ref)
+    return refs
 
 
-ILEX_BROWSER = PersistentChromeSession()
-
-
-_ILEX_SESSION_ERROR_MARKER = "сессия не авторизована"
-
-
-async def search_ilex(query: str, max_results: int = 10) -> list[dict]:
-    """
-    Ищет документы на ilex.by через поисковую строку.
-
-    Помимо обычной выдачи search/extended ilex показывает тематические блоки
-    (например, таблицу «Избежание двойного налогообложения»). Их строки приходят
-    отдельным запросом classifier/content и поэтому раньше были невидимы MCP.
-    """
-    cached_results = load_ilex_search_cache(query, max_results)
-    if cached_results is not None:
-        return cached_results
-
-    try:
-        results = await _search_ilex_once(query, max_results)
-    except RuntimeError as exc:
-        # Профиль Chrome копируется один раз на весь срок MCP-процесса
-        # (PersistentChromeSession). Если реальная сессия в Chrome обновилась
-        # и протухший клон больше не авторизован — переклонируем профиль один
-        # раз и повторим, прежде чем сообщать пользователю о неавторизованной
-        # сессии (которая на деле может быть просто устаревшим снимком).
-        if _ILEX_SESSION_ERROR_MARKER not in str(exc):
-            raise
-        await ILEX_BROWSER.close()
-        results = await _search_ilex_once(query, max_results)
-
-    save_ilex_search_cache(query, max_results, results)
-    return results
-
-
-async def _search_ilex_once(query: str, max_results: int) -> list[dict]:
-    results = []
-    async with ILEX_BROWSER.page() as page:
-        # Перехватываем как обычную выдачу, так и тематические классификаторы.
-        search_data = {}
-        extended_loaded = asyncio.Event()
-        smart_entities_loaded = asyncio.Event()
-        classifier_loaded = asyncio.Event()
-        classifier_expected = False
-
-        async def capture(response):
-            nonlocal classifier_expected
-            if any(endpoint in response.url for endpoint in (
-                "search/extended", "search/autocomplete", "search/smart-entities",
-                "classifier/content"
-            )):
-                try:
-                    data = await response.json()
-                    search_data[response.url] = data
-                    if "search/extended" in response.url:
-                        extended_loaded.set()
-                    elif "search/smart-entities" in response.url:
-                        classifier_expected = bool(
-                            isinstance(data, dict) and data.get("classifierBlockModel")
-                        )
-                        smart_entities_loaded.set()
-                    elif "classifier/content" in response.url:
-                        classifier_loaded.set()
-                except Exception:
-                    pass
-        page.on("response", capture)
-
-        with perf_stage("ilex_home_load"):
-            await page.goto(
-                "https://ilex-private.ilex.by/home",
-                wait_until="networkidle",
-                timeout=30000,
-            )
-
-        inp = await page.query_selector("input.search-input")
-        if inp is None:
-            raise RuntimeError(
-                "Поле поиска не найдено на странице ilex.by — вероятно, сессия не авторизована "
-                "(нужно войти в ilex.by в Chrome под тем же профилем) либо страница не успела "
-                "загрузиться."
-            )
-        with perf_stage("ilex_search_wait"):
-            await inp.click()
-            await inp.fill(query)
-            await page.wait_for_timeout(1500)
-
-            btn = await page.query_selector("button.search-button")
-            if btn:
-                await btn.click()
-            else:
-                await inp.press("Enter")
-
-            await page.wait_for_load_state("networkidle", timeout=15000)
-            # Обычная и тематическая выдачи загружаются независимо.
-            for event, timeout in ((extended_loaded, 5), (smart_entities_loaded, 5)):
-                try:
-                    await asyncio.wait_for(event.wait(), timeout=timeout)
-                except asyncio.TimeoutError:
-                    pass
-            if classifier_expected and not classifier_loaded.is_set():
-                try:
-                    await asyncio.wait_for(classifier_loaded.wait(), timeout=5)
-                except asyncio.TimeoutError:
-                    pass
-
-        # Тематический классификатор содержит более точные прямые ссылки на НПА.
-        for url, data in search_data.items():
-            if "classifier/content" in url and isinstance(data, dict):
-                results.extend(parse_ilex_classifier_results(data, max_results))
-
-        # Парсим обычные результаты из перехваченного API.
-        for url, data in search_data.items():
-            if "search/extended" in url and isinstance(data, dict):
-                hits = data.get("hits", [])
-                for hit in hits:
-                    infobank = hit.get("infoBank", {}).get("value", "")
-                    num = hit.get("numberInInfoBank")
-                    name = hit.get("name", "").replace("<em>", "").replace("</em>", "")
-                    snippet = hit.get("snippet", "").replace("<em>", "").replace("</em>", "")
-                    if infobank and num:
-                        doc_url = f"https://ilex-private.ilex.by/view-document/{infobank}/{num}/"
-                        add_unique_ilex_result(results, {
-                            "title": name,
-                            "url": doc_url,
-                            "snippet": snippet,
-                            "source": "обычная выдача",
-                        }, max_results)
-                    if len(results) >= max_results:
-                        break
-                break
-
-        # Fallback: парсим ссылки со страницы.
-        if not results:
-            links = await page.query_selector_all("a[href*='view-document']")
-            seen = set()
-            for link in links[:max_results]:
-                href = await link.get_attribute("href")
-                text = (await link.inner_text()).strip()
-                if href and href not in seen:
-                    seen.add(href)
-                    full = href if href.startswith("http") else f"https://ilex-private.ilex.by{href}"
-                    add_unique_ilex_result(results, {
-                        "title": text[:120],
-                        "url": full,
-                        "snippet": "",
-                        "source": "страница результатов",
-                    }, max_results)
-
-    return results
-
-
-def parse_ilex_classifier_link(value: str) -> tuple[str, int, str | None] | None:
-    """Разбирает внутреннюю ссылку ilex вида Б=BELAW_Д=13142_М=100012."""
-    match = re.search(r"Б=([^_]+)_Д=(\d+)(?:_М=(\d+))?", value or "")
+def parse_ilex_document_ref(value: str) -> tuple[str, int] | None:
+    """Принимает ссылку .../view-document/BELAW/13142/... или краткую BELAW/13142."""
+    value = value or ""
+    match = re.search(r"view-document/([A-Za-z]+)/(\d+)", value)
+    if not match:
+        match = re.fullmatch(r"\s*\[?([A-Za-z]+)[/:](\d+)\]?/?\s*", value)
     if not match:
         return None
-    return match.group(1), int(match.group(2)), match.group(3)
+    return match.group(1).upper(), int(match.group(2))
+
+
+def ilex_document_url(infobank: str, number: int | str) -> str:
+    return f"{ILEX_WEB_BASE_URL}/view-document/{infobank}/{number}/"
 
 
 def canonical_ilex_document_url(url: str) -> str:
-    """Убирает поисковый хвост и якорь, чтобы дедуплицировать один документ."""
-    match = re.search(r"(https?://[^/]+/view-document/[^/]+/\d+/)", url)
-    return match.group(1) if match else url.split("#", 1)[0].split("?", 1)[0]
+    """
+    Приводит любую ссылку на документ к одному виду: API отдаёт ссылки на
+    ilex.by, а пользователь и старые ответы — на ilex-private.ilex.by. Без
+    этого доказательства в validate_legal_research расходились бы по хостам.
+    """
+    ref = parse_ilex_document_ref(url)
+    if ref:
+        return ilex_document_url(*ref)
+    return url.split("#", 1)[0].split("?", 1)[0]
+
+
+def add_unique_ilex_result(results: list[dict], result: dict, max_results: int) -> None:
+    if len(results) >= max_results:
+        return
+    canonical = canonical_ilex_document_url(result["url"])
+    if any(canonical_ilex_document_url(item["url"]) == canonical for item in results):
+        return
+    results.append(result)
+
+
+def parse_ilex_search_results(data: dict, max_results: int = ILEX_SEARCH_MAX_RESULTS) -> list[dict]:
+    """Преобразует ответ search/documents в уникальные документы."""
+    results: list[dict] = []
+    documents = data.get("documents", []) if isinstance(data, dict) else []
+    for document in documents:
+        if not isinstance(document, dict):
+            continue
+        infobank = str(document.get("infoBank") or "").upper()
+        number = document.get("number")
+        if not infobank or number in (None, ""):
+            continue
+        segments = document.get("segments") or []
+        segment = segments[0] if segments and isinstance(segments[0], dict) else {}
+        add_unique_ilex_result(results, {
+            "title": re.sub(
+                r"\s+", " ", clean_ilex_markup(str(document.get("title") or ""))
+            ).strip(),
+            "url": ilex_document_url(infobank, number),
+            "infobank": infobank,
+            "status": str(document.get("status") or ""),
+            "segment_id": str(segment.get("id") or ""),
+            "snippet": re.sub(
+                r"\s+", " ", clean_ilex_markup(str(segment.get("text") or ""))
+            ).strip(),
+        }, max_results)
+    return results
+
+
+async def search_ilex(
+    query: str,
+    max_results: int = ILEX_SEARCH_MAX_RESULTS,
+    category: str | None = None,
+) -> list[dict]:
+    """Ищет документы через официальное API ilex (не более 10 по релевантности)."""
+    query = re.sub(r"\s+", " ", query or "").strip()
+    if not query:
+        raise IlexApiError("Пустой поисковый запрос.")
+    if len(query) > ILEX_SEARCH_MAX_QUERY_CHARS:
+        raise IlexApiError(
+            f"Поисковый запрос длиннее {ILEX_SEARCH_MAX_QUERY_CHARS} символов "
+            f"({len(query)}). Сформулируйте короткий предметный запрос."
+        )
+    max_results = max(1, min(int(max_results), ILEX_SEARCH_MAX_RESULTS))
+    cache_key = f"{ILEX_SEARCH_CACHE_KEY_PREFIX}\n{category or ''}\n{query}"
+    cached_results = load_ilex_search_cache(cache_key, max_results)
+    if cached_results is not None:
+        return cached_results
+
+    data = await ILEX_API.search_documents(query, category)
+    # Кешируется вся выдача API, чтобы запрос с большим max_results не шёл в сеть.
+    results = parse_ilex_search_results(data, ILEX_SEARCH_MAX_RESULTS)
+    save_ilex_search_cache(cache_key, ILEX_SEARCH_MAX_RESULTS, results)
+    return results[:max_results]
 
 
 def canonical_section_locator(locator: str) -> str:
@@ -1236,6 +1312,17 @@ def ilex_document_heading(text: str) -> str:
     return " ".join(lines)[:600]
 
 
+def ilex_heading_source(document: dict) -> str:
+    """
+    Текст для распознавания заголовка: название из карточки API идёт первым
+    абзацем, поэтому ilex_document_heading берёт именно его, а не угадывает
+    заголовок по первым строкам текста.
+    """
+    name = (document.get("properties") or {}).get("name", "")
+    text = document.get("text", "")
+    return f"{name}\n\n{text}" if name else text
+
+
 def _distinctive_tokens(value: str) -> set[str]:
     words = {
         word.lower()
@@ -1271,8 +1358,8 @@ def discover_related_cached_ilex_documents(
         try:
             data = json.loads(cache_path.read_text(encoding="utf-8"))
             candidate_url = canonical_ilex_document_url(data.get("url", ""))
-            candidate_text = data.get("text", "")
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            candidate_text = ilex_heading_source(data)
+        except (OSError, ValueError, TypeError, AttributeError, json.JSONDecodeError):
             continue
         if not candidate_url or candidate_url == current or "/BELAW/" not in candidate_url:
             continue
@@ -1326,20 +1413,34 @@ def ilex_document_metadata(
     text: str,
     revision: str | None = None,
     current_year: int | None = None,
+    properties: dict | None = None,
 ) -> dict:
+    """
+    Карточка API (properties) точнее разбора текста; текст используется как
+    запасной источник, если поля карточки пусты.
+    """
+    properties = properties or {}
+    note = properties.get("note", "")
+    heading_text = (
+        f"{properties['name']}\n\n{text}" if properties.get("name") else text
+    )
     entry_force = re.search(
+        r"(?i)начало\s+действия\s+документа\s*[-‐‑‒–—−]\s*(\d{2}\.\d{2}\.\d{4})",
+        note,
+    ) or re.search(
         r"(?i)\bвступил[оа]?\s+в\s+силу\s+"
         r"(\d{1,2}\s+[а-яё]+\s+\d{4}\s+года|\d{2}\.\d{2}\.\d{4})",
         text[:8000],
     )
     return {
-        "title": ilex_document_heading(text),
-        "revision": revision,
+        "title": ilex_document_heading(heading_text) or properties.get("name", ""),
+        "revision": revision or properties.get("editionDate") or None,
         "entry_into_force": entry_force.group(1) if entry_force else None,
-        "requires_related_review": document_requires_related_review(text),
+        "requires_related_review": document_requires_related_review(heading_text),
         "future_change_markers": extract_future_change_markers(
-            text, current_year=current_year
+            f"{note}\n{text}" if note else text, current_year=current_year
         ),
+        "linked_documents": ilex_linked_documents(note),
     }
 
 
@@ -1510,216 +1611,418 @@ def validate_legal_research_state(
     }
 
 
-def add_unique_ilex_result(results: list[dict], result: dict, max_results: int) -> None:
-    if len(results) >= max_results:
-        return
-    canonical = canonical_ilex_document_url(result["url"])
-    if any(canonical_ilex_document_url(item["url"]) == canonical for item in results):
-        return
-    results.append(result)
-
-
-def parse_ilex_classifier_results(data: dict, max_results: int = 10) -> list[dict]:
-    """Преобразует строки тематической таблицы ilex в уникальные документы."""
-    grouped: dict[tuple[str, int], dict] = {}
-    for row in data.get("content", []):
-        if not isinstance(row, dict):
-            continue
-        document_ref = parse_ilex_classifier_link(row.get("link_0", ""))
-        if document_ref is None:
-            continue
-        infobank, number, segment = document_ref
-        key = (infobank, number)
-        item = grouped.setdefault(key, {
-            "title": str(row.get("0", "")).strip(),
-            "url": (
-                f"https://ilex-private.ilex.by/view-document/{infobank}/{number}/"
-                + (f"#M{segment}" if segment else "")
-            ),
-            "snippets": [],
-        })
-        details = [str(row.get(column, "")).strip() for column in ("1", "2", "3")]
-        snippet = " — ".join(value for value in details if value)
-        if snippet and snippet not in item["snippets"]:
-            item["snippets"].append(snippet)
-
-    results = []
-    for item in grouped.values():
-        results.append({
-            "title": item["title"],
-            "url": item["url"],
-            "snippet": "; ".join(item["snippets"]),
-            "source": "тематический классификатор ilex",
-        })
-        if len(results) >= max_results:
-            break
-    return results
-
-
-def is_ilex_url(url: str) -> bool:
-    return "ilex.by" in url
-
-
 def url_to_ilex_cache_path(url: str) -> Path:
+    ref = parse_ilex_document_ref(url)
+    if ref:
+        return ILEX_CACHE_DIR / f"{ref[0]}_{ref[1]}.json"
     key = hashlib.md5(url.encode()).hexdigest()
     return ILEX_CACHE_DIR / f"{key}.json"
 
 
-def extract_ilex_revision(title: str) -> str | None:
-    match = re.search(r'\(ред\.\s*от\s*(\d{2}\.\d{2}\.\d{4})\)', title)
-    return match.group(1) if match else None
+ILEX_STATUS_LABELS = {
+    "ё": "Не вступил в силу",
+    "+": "Утратил силу или отменен",
+    "-": "Все акты, кроме утративших силу или не вступивших в силу",
+    "=": "Не применяется",
+    "%": "Изменен (для суд. актов по конкретным делам)",
+    "!": "Утратил значение",
+}
+ILEX_EDITION_LABELS = {
+    "d": "Последняя редакция",
+    "v": "Редакция с изменениями, не вступившими в силу",
+    "n": "Другая (не последняя) редакция",
+}
+ILEX_INFO_TYPE_LABELS = {
+    "а": "Нормативный акт",
+    "a": "Нормативный акт",
+    "g": "Индивидуальный правовой акт",
+    "j": "Частное письмо",
+    "l": "Судебное решение",
+    "p": "Справочная информация",
+    "r": "Проект",
+    "t": "Материал консультационного характера",
+    "z": "Тип не определен",
+}
 
 
-async def get_ilex_title(url: str) -> str:
+def ilex_property_code(value, labels: dict[str, str]) -> tuple[str, str]:
+    """Разбирает поле карточки вида «d» или «d_Последняя редакция»."""
+    raw = str(value or "").strip()
+    if not raw:
+        return "", ""
+    code, _, label = raw.partition("_")
+    code = code.strip()
+    return code, label.strip() or labels.get(code, code)
+
+
+def _ilex_segment_text(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        return "\n".join(_ilex_segment_text(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return "\n".join(_ilex_segment_text(item) for item in value)
+    return str(value)
+
+
+def _ilex_segment_items(raw) -> list[tuple[str, str]]:
     """
-    Быстро получает title страницы документа ilex.by (без клика по экспорту в Word) —
-    используется только для проверки актуальности редакции перед решением, брать ли кеш.
+    Сегменты приходят списком объектов {"<id>": "<текст>"}. Допускаются и
+    варианты {"id": ..., "text": ...} или один объект-словарь — формат таблиц
+    в документации API не показан.
     """
-    async with ILEX_BROWSER.page() as page:
-        with perf_stage("ilex_revision_page_load"):
-            await page.goto(
-                url, wait_until="domcontentloaded", timeout=30000
-            )
-        title = ""
-        for _ in range(10):
-            title = await page.title()
-            if title:
-                break
-            await page.wait_for_timeout(300)
-        return title
+    if isinstance(raw, dict):
+        raw = [raw]
+    items = []
+    # Ключ бывает составным: «104267##104247,100001» — собственный номер
+    # сегмента идёт до «##», дальше номера связанных сегментов.
+    for entry in raw or []:
+        if isinstance(entry, dict):
+            if "text" in entry and ("id" in entry or "segmentId" in entry):
+                segment_id = entry.get("id", entry.get("segmentId"))
+                items.append((
+                    str(segment_id).split("##", 1)[0],
+                    _ilex_segment_text(entry["text"]),
+                ))
+                continue
+            for segment_id, value in entry.items():
+                items.append((
+                    str(segment_id).split("##", 1)[0],
+                    _ilex_segment_text(value),
+                ))
+        elif entry is not None:
+            items.append(("", _ilex_segment_text(entry)))
+    return items
 
 
-_ANSICPG_RE = re.compile(rb"\\ansicpg(\d+)")
+_ILEX_BARE_POINT_NUMBER_RE = re.compile(rf"\d+(?:(?:\.|[-{_DASHES}])\d+)*\.")
 
 
-def _rtf_codepage_name(raw_bytes: bytes) -> str:
-    match = _ANSICPG_RE.search(raw_bytes)
-    if not match:
-        return "cp1252"
-    return f"cp{match.group(1).decode('ascii')}"
-
-
-def rtf_to_plain_text(rtf_path: Path) -> str:
+def parse_ilex_api_document(data: dict) -> tuple[str, dict, list[str]]:
     """
-    Конвертирует RTF в текст. На macOS использует встроенный textutil — он даёт
-    полный и корректно структурированный текст. Библиотека striprtf (кросс-платформенный
-    фолбэк) на больших документах с таблицами теряет значительную часть содержимого.
-
-    Экспорт ilex.by иногда кладёт кириллицу как сырые байты кодовой страницы,
-    заявленной в \\ansicpg (обычно 1251), а не как \\'XX-escape. Декодирование
-    таким utf-8 с errors="ignore" молча стирает всю кириллицу вместо ошибки —
-    поэтому striprtf-фолбэк декодирует по кодовой странице, указанной в самом
-    RTF-заголовке.
+    Собирает текст документа из сегментов API. Абзацы разделяются пустой
+    строкой — на это рассчитаны split_paragraphs и структурный индекс. Таблицы
+    встраиваются по номеру сегмента, если номера числовые.
     """
-    import platform
-    import subprocess
+    if not isinstance(data, dict):
+        raise IlexApiError("API ilex вернуло документ в неожиданном формате.")
+    segments = _ilex_segment_items(data.get("segments"))
+    tables = _ilex_segment_items(data.get("tablesSegments"))
+    items = segments + tables
+    if tables and all(segment_id.isdigit() for segment_id, _ in items):
+        # sorted() стабилен: при совпадении номера обычный текст идёт раньше.
+        items = sorted(items, key=lambda item: int(item[0]))
+    paragraphs = []
+    segment_ids = []
+    for segment_id, value in items:
+        paragraph = clean_ilex_markup(value).strip()
+        if not paragraph:
+            continue
+        if paragraphs and _ILEX_BARE_POINT_NUMBER_RE.fullmatch(paragraphs[-1]):
+            # В таблицах номер пункта («21.4.») — отдельная ячейка, а текст
+            # пункта — следующая. Без склейки структурный индекс не видит
+            # заголовок пункта: после номера нет текста на той же строке.
+            paragraphs[-1] = f"{paragraphs[-1]} {paragraph}"
+            continue
+        paragraphs.append(paragraph)
+        segment_ids.append(segment_id)
 
-    if platform.system() == "Darwin":
-        result = subprocess.run(
-            ["textutil", "-convert", "txt", "-stdout", str(rtf_path)],
-            capture_output=True, timeout=60,
+    raw_properties = data.get("properties")
+    if not isinstance(raw_properties, dict):
+        raw_properties = {
+            key: value for key, value in data.items()
+            if key not in {"segments", "tablesSegments"}
+        }
+    properties = {}
+    for key, value in raw_properties.items():
+        if isinstance(value, (list, tuple)):
+            value = "; ".join(str(item) for item in value if item not in (None, ""))
+        properties[key] = clean_ilex_markup("" if value is None else str(value)).strip()
+    if "infobank" in properties and "infoBank" not in properties:
+        properties["infoBank"] = properties.pop("infobank")
+    return "\n\n".join(paragraphs), properties, segment_ids
+
+
+def _parse_ilex_date(value: str):
+    try:
+        return datetime.strptime((value or "").strip(), "%d.%m.%Y").date()
+    except ValueError:
+        return None
+
+
+def ilex_document_warnings(properties: dict, today=None) -> list[str]:
+    """Предупреждения о статусе, которые меняют применимость норм документа."""
+    today = today or datetime.now().date()
+    warnings = []
+    status_code, status_label = ilex_property_code(
+        properties.get("status"), ILEX_STATUS_LABELS
+    )
+    if status_code in {"+", "ё", "=", "!"}:
+        warnings.append(f"⚠️ Статус документа: {status_label}.")
+    edition_code, _ = ilex_property_code(
+        properties.get("edition"), ILEX_EDITION_LABELS
+    )
+    if edition_code == "v":
+        warnings.append(
+            "⚠️ Это редакция с изменениями, которые ещё не вступили в силу. "
+            "Для действующих норм нужна последняя действующая редакция."
         )
-        if result.returncode == 0:
-            return result.stdout.decode("utf-8", errors="ignore")
+    elif edition_code == "n":
+        first_edition = properties.get("firstEdition")
+        hint = (
+            f" (первая редакция этого документа: "
+            f"{properties.get('infoBank') or 'BELAW'}/{first_edition})"
+            if first_edition else ""
+        )
+        warnings.append(
+            "⚠️ Это не последняя редакция документа" + hint
+            + ". Найдите действующую редакцию через search_ilex."
+        )
+    terminate = _parse_ilex_date(properties.get("terminateEffectDate", ""))
+    if terminate and terminate < today:
+        warnings.append(
+            "⚠️ Действие этой редакции окончено "
+            f"{properties['terminateEffectDate']}."
+        )
+    elif terminate and edition_code == "d" and ilex_property_code(
+        properties.get("controlType"), {}
+    )[0] == "5":
+        # Дата окончания сама по себе бывает технической (у международных
+        # договоров встречается 31.12.2035); о будущих изменениях достоверно
+        # говорит только тип контроля 5 — «создана редакция с изменениями,
+        # не вступившими в силу».
+        warnings.append(
+            f"⚠️ Эта редакция действует по {properties['terminateEffectDate']}: "
+            "после этой даты вступают в силу изменения, которые в текст не "
+            "включены. Для отношений после неё нужна будущая редакция; к текущим "
+            "отношениям эти изменения не применяй."
+        )
+    take_effect = _parse_ilex_date(properties.get("takeEffectDate", ""))
+    if take_effect and take_effect > today:
+        warnings.append(
+            "⚠️ Эта редакция начинает действовать только с "
+            f"{properties['takeEffectDate']}."
+        )
+    info_code, info_label = ilex_property_code(
+        properties.get("infoType"), ILEX_INFO_TYPE_LABELS
+    )
+    if info_code and info_code not in {"a", "а"}:
+        warnings.append(
+            f"⚠️ Тип информации: {info_label} — не нормативный правовой акт."
+        )
+    return warnings
 
-    from striprtf.striprtf import rtf_to_text
-    raw_bytes = rtf_path.read_bytes()
-    codepage = _rtf_codepage_name(raw_bytes)
+
+def ilex_authorities_label(value: str) -> str:
+    """«Сокращение_Полное наименование» → полное наименование, без повторов."""
+    names = []
+    for item in (value or "").split("; "):
+        short, _, full = item.partition("_")
+        name = (full or short).strip()
+        if name and name not in names:
+            names.append(name)
+    return "; ".join(names)
+
+
+def ilex_document_brief(document: dict) -> str:
+    """Одна строка реквизитов редакции для ответов с текстом норм."""
+    properties = document.get("properties") or {}
+    parts = []
+    ref = parse_ilex_document_ref(document.get("url", ""))
+    if ref:
+        parts.append(f"{ref[0]}/{ref[1]}")
+    _, edition_label = ilex_property_code(properties.get("edition"), ILEX_EDITION_LABELS)
+    if edition_label:
+        edition_date = properties.get("editionDate")
+        parts.append(
+            edition_label + (f" (изменения от {edition_date})" if edition_date else "")
+        )
+    if properties.get("takeEffectDate"):
+        parts.append(f"редакция действует с {properties['takeEffectDate']}")
+    if properties.get("terminateEffectDate"):
+        parts.append(f"по {properties['terminateEffectDate']}")
+    lines = [f"_[{' · '.join(parts)}]_"] if parts else []
+    lines.extend(ilex_document_warnings(properties))
+    if document.get("amendment_notes_missing"):
+        lines.append(AMENDMENT_NOTES_WARNING)
+    if parse_ilex_document_ref(document.get("url", "")):
+        lines.append(EDITORIAL_NOTES_WARNING)
+    return "\n".join(lines) + "\n\n" if lines else ""
+
+
+# Редакционная пометка — отдельный абзац вида «(в ред. Закона … N …)»,
+# «(п. 2 исключен. - …)». Оговорки «(утратил силу …)» внутри текста нормы
+# пометками не считаются: по ним нельзя отличить полный текст от урезанного.
+_AMENDMENT_NOTE_RE = re.compile(
+    r"(?m)^[ \t]*\((?:[^()\n]{0,40}\b)?"
+    r"(?:в\s+ред\.|введен\w*|исключен\w*|утратил\w*\s+силу)"
+    r"[^()]{0,400}\)[ \t]*$",
+    re.IGNORECASE,
+)
+
+
+def amendment_notes_missing(text: str, properties: dict) -> bool:
+    """
+    API ilex отдаёт текст части документов (ТК, НК, КоАП и др.) без
+    редакционных пометок и примечаний со ссылками на связанные акты, которые
+    есть в веб-версии. В полных консолидированных текстах у изменённого
+    документа (заполнено «редакция от») такие пометки стоят у каждой
+    изменённой нормы, поэтому их полное отсутствие означает потерю, а не
+    отсутствие изменений.
+    """
+    return bool(properties.get("editionDate")) and not _AMENDMENT_NOTE_RE.search(text)
+
+
+# Сравнение с прежним экспортом RTF показало, что API не передаёт
+# редакционные примечания ilex ни в одном документе: сроки вступления в силу
+# отдельных абзацев, распространение изменений на прошлые отношения, правила
+# из других актов и «КонсультантПлюс: примечание» со ссылками на связанные акты.
+EDITORIAL_NOTES_WARNING = (
+    "ℹ️ API ilex не передаёт редакционные примечания к нормам: отдельные сроки "
+    "вступления в силу абзацев и пунктов, распространение изменений на прошлые "
+    "отношения, специальные правила из других актов и примечания со ссылками на "
+    "связанные акты. Абзацы, ещё не вступившие в силу, могут присутствовать в "
+    "тексте без пометки — сверь применяемую норму со справкой "
+    "(inspect_ilex_document) и с вводящим её изменяющим актом."
+)
+AMENDMENT_NOTES_WARNING = (
+    "⚠️ API ilex не передаёт для этого документа редакционные пометки к нормам "
+    "(«в ред. …», «исключён …», «введён …», примечания со ссылками на связанные "
+    "акты). Какой акт последним изменил конкретную норму и была ли исключена "
+    "соседняя норма, по этому тексту не подтверждается; изменяющие акты "
+    "редакции перечислены в справке (inspect_ilex_document)."
+)
+
+
+def _ilex_text_digest(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def read_ilex_document_cache(cache_path: Path) -> dict | None:
     try:
-        raw = raw_bytes.decode(codepage, errors="replace")
-    except LookupError:
-        raw = raw_bytes.decode("utf-8", errors="ignore")
-    return rtf_to_text(raw)
+        data = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("text"), str):
+        return None
+    return data
 
 
-async def get_ilex_document_content(url: str) -> tuple[str, str | None]:
+async def ilex_document_changed_since(
+    infobank: str,
+    doc_id: int,
+    checked_at: float,
+    now: float | None = None,
+) -> bool:
     """
-    Открывает документ ilex.by через headless Chrome и возвращает (текст, дата_редакции).
-    Использует кнопку «Экспорт в Word» вместо чтения текста из DOM: у ilex большие документы
-    рендерятся с виртуальным скроллом (в DOM всегда только видимая часть), поэтому прямое
-    чтение #documentContent обрезает документ до нескольких первых экранов.
+    Проверяет через documents/history, публиковался ли документ после
+    последней подтверждённой проверки. Дата «с» включается, поэтому
+    публикация в тот же день после проверки тоже будет замечена.
     """
-    import shutil
-    import tempfile
-
-    export_dir = Path(tempfile.mkdtemp())
-    try:
-        async with ILEX_BROWSER.page() as page:
-            with perf_stage("ilex_document_page_load"):
-                await page.goto(url, wait_until="networkidle", timeout=30000)
-            title = await page.title()
-
-            export_btn = await page.query_selector(".export-word-button")
-            if export_btn:
-                with perf_stage("ilex_word_export_download"):
-                    async with page.expect_download(timeout=90000) as download_info:
-                        await export_btn.click()
-                    download = await download_info.value
-                    rtf_path = export_dir / "export.rtf"
-                    await download.save_as(rtf_path)
-                with perf_stage("rtf_to_text"):
-                    text = rtf_to_plain_text(rtf_path)
-            else:
-                content_el = await page.query_selector("#documentContent")
-                text = await content_el.inner_text() if content_el else await page.inner_text("body")
-    finally:
-        shutil.rmtree(export_dir, ignore_errors=True)
-
-    revision = extract_ilex_revision(title)
-    return text, revision
+    now = time.time() if now is None else now
+    checked_date = datetime.fromtimestamp(checked_at or now).date()
+    today = datetime.fromtimestamp(now).date()
+    if (today - checked_date).days >= ILEX_HISTORY_MAX_DAYS:
+        # API отклоняет интервал от 7 дней («Date difference should be less
+        # than 7 days»): старый кеш проще сверить полной загрузкой.
+        return True
+    history = await ILEX_API.document_history(
+        checked_date.isoformat(), today.isoformat(),
+        infobanks=[infobank], docs=[doc_id],
+    )
+    published = history.get(infobank, []) if isinstance(history, dict) else []
+    return str(doc_id) in {str(item) for item in published or []}
 
 
-async def fetch_ilex_pages(url: str, bypass_cache: bool = False) -> tuple[list[str] | str, str]:
+_ILEX_DOCUMENT_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+async def fetch_ilex_document(url: str, bypass_cache: bool = False) -> tuple[dict | str, str]:
     """
-    Возвращает (список страниц | строка с ошибкой, статус кеша) для документа ilex.by.
-    Перед использованием кеша проверяет актуальность через дату редакции в title страницы
-    (лёгкая загрузка без клика по экспорту — быстрее полного скачивания в разы). Если у
-    документа нет даты редакции в title (не все типы документов на ilex её содержат) —
-    кеш считается доверенным без проверки, аналогично поведению для pravo.by без карточки.
-    """
-    cache_path = url_to_ilex_cache_path(url)
-    forced_refresh = bypass_cache
-    revision_changed = False
+    Возвращает (документ | строка с ошибкой, статус кеша) для документа ilex.
 
-    if cache_path.exists() and not bypass_cache:
-        with perf_stage("ilex_cache_read"):
-            data = json.loads(cache_path.read_text(encoding="utf-8"))
-        cached_revision = data.get("revision")
-        current_revision = None
+    Документ: {"url", "text", "properties", "structure_index", ...}. Кеш
+    используется, только если documents/history не сообщает о публикации
+    документа после последней проверки; если проверка недоступна, документ
+    перекачивается, а не берётся из кеша вслепую.
+    """
+    ref = parse_ilex_document_ref(url)
+    if ref is None:
+        return (
+            "Не удалось распознать документ ilex: ожидается ссылка вида "
+            ".../view-document/BELAW/<номер>/ или BELAW/<номер>."
+        ), "error"
+    infobank, doc_id = ref
+    canonical_url = ilex_document_url(infobank, doc_id)
+    cache_path = url_to_ilex_cache_path(canonical_url)
+
+    # Параллельные вызовы по одному документу не должны качать его дважды.
+    lock = _ILEX_DOCUMENT_LOCKS.setdefault(canonical_url, asyncio.Lock())
+    async with lock:
+        history_failed = False
+        cached = None if bypass_cache else read_ilex_document_cache(cache_path)
+        if cached and cached.get("version") != ILEX_DOCUMENT_CACHE_VERSION:
+            cached = None
+        if cached:
+            checked_at = cached.get("checked_at") or 0
+            if 0 <= time.time() - checked_at <= ILEX_REVISION_CHECK_INTERVAL_SECONDS:
+                return cached, "cached"
+            try:
+                changed = await ilex_document_changed_since(
+                    infobank, doc_id, checked_at
+                )
+            except IlexApiError as exc:
+                log_perf("ilex_history_check_failed", status_code=exc.status_code)
+                changed = True
+                history_failed = True
+            if not changed:
+                cached["checked_at"] = time.time()
+                write_json_atomic(cache_path, cached)
+                return cached, "cached"
+
+        # Кеш прежнего формата пересобирается, но это не новая редакция.
+        had_cache = cached is not None or (bypass_cache and cache_path.exists())
         try:
-            current_revision = extract_ilex_revision(await get_ilex_title(url))
-        except Exception:
-            pass
-        if current_revision and current_revision != cached_revision:
-            bypass_cache = True
-            revision_changed = True
-        else:
-            return [data["text"]], "cached"
+            data = await ILEX_API.get_document(infobank, doc_id)
+            with perf_stage("ilex_api_document_parse"):
+                text, properties, segment_ids = parse_ilex_api_document(data)
+        except IlexApiError as exc:
+            if cached and history_failed:
+                # API недоступно целиком: лучше отдать кеш с явной пометкой,
+                # чем ничего. validate_legal_research не засчитает такую
+                # редакцию как проверенную.
+                return cached, "unverified"
+            return f"Ошибка загрузки документа {infobank}/{doc_id}: {exc}", "error"
+        if not text.strip():
+            return "Документ получен из API ilex, но его текст пуст.", "error"
 
-    try:
-        with perf_stage("ilex_document_fetch_total"):
-            text, revision = await get_ilex_document_content(url)
-    except Exception as e:
-        return f"Ошибка загрузки документа: {e}", "error"
-
-    if not text.strip():
-        return "Документ загружен, но текст пуст.", "error"
-
-    was_updated = cache_path.exists()
-    with perf_stage("ilex_index_and_cache_write"):
-        cache_path.write_text(json.dumps({
-            "url": url,
+        digest = _ilex_text_digest(text)
+        structure_index = build_structural_index([text])
+        document = {
+            "version": ILEX_DOCUMENT_CACHE_VERSION,
+            "url": canonical_url,
             "text": text,
-            "structure_index": build_structural_index([text]),
-            "revision": revision,
+            "properties": properties,
+            "segment_ids": segment_ids,
+            "text_digest": digest,
+            "structure_index": structure_index,
+            "amendment_notes_missing": amendment_notes_missing(text, properties),
             "cached_at": datetime.now().isoformat(),
-        }, ensure_ascii=False), encoding="utf-8")
+            "checked_at": time.time(),
+        }
+        with perf_stage("ilex_cache_write"):
+            write_json_atomic(cache_path, document)
 
-    if not was_updated:
-        return [text], "downloaded"
-    if revision_changed:
-        return [text], "updated"
-    return [text], "refreshed" if forced_refresh else "updated"
+    if not had_cache:
+        return document, "downloaded"
+    if bypass_cache:
+        return document, "refreshed"
+    if cached and cached.get("text_digest") == digest:
+        # История отметила публикацию (или была недоступна), но текст не изменился.
+        return document, "cached"
+    return document, "updated"
 
 
 def ilex_cache_status_note(status: str) -> str:
@@ -1731,22 +2034,12 @@ def ilex_cache_status_note(status: str) -> str:
         return "_[⚠️ обнаружена новая редакция — кеш обновлён]_\n\n"
     if status == "refreshed":
         return "_[кеш принудительно обновлён по запросу]_\n\n"
+    if status == "unverified":
+        return (
+            "_[⚠️ API ilex недоступно — показан кеш, актуальность редакции "
+            "НЕ проверена; повтори запрос позже]_\n\n"
+        )
     return ""
-
-
-async def fetch_authenticated_page(url: str) -> str:
-    """Скачивает страницу через реальный Chrome с профилем пользователя (headless)."""
-    if is_ilex_url(url):
-        # Документы ilex.by рендерятся с виртуальным скроллом — прямое чтение DOM обрезает
-        # большие документы до нескольких первых экранов. get_ilex_document_content уже решает
-        # это через экспорт в Word (см. поиск проблемы у search_ilex_document).
-        text, _ = await get_ilex_document_content(url)
-        return text
-
-    async with ILEX_BROWSER.page() as page:
-        await page.goto(url, wait_until="networkidle", timeout=30000)
-        text = await page.inner_text("body")
-        return text
 
 
 @server.list_tools()
@@ -1801,14 +2094,14 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(
             name="search_ilex",
             description=(
-                "Ищет документы на ilex.by по текстовому запросу. "
-                "Возвращает список найденных документов с заголовками и ссылками. "
-                "Используй когда нужно найти НПА или статью по теме, а прямой ссылки нет. "
-                "Запросы формулируй короткими и по теме («исчисление среднего заработка»), "
-                "а не длинными формальными реквизитами акта («постановление Минтруда №47 "
-                "об исчислении среднего заработка») — поиск ilex смысловой/полнотекстовый "
-                "и на длинные запросы с номером постановления и органом часто не находит ничего, "
-                "хотя тот же смысл коротким запросом находится сразу. "
+                "Ищет документы ilex.by через официальное API по текстовому запросу. "
+                "Возвращает до 10 документов по релевантности: название, ссылку, "
+                "информационный банк, статус («Действующая редакция» и т.п.) и один "
+                "релевантный фрагмент. Используй, когда нужно найти НПА или статью по теме, "
+                "а прямой ссылки нет. Запросы формулируй короткими и по теме («исчисление "
+                "среднего заработка»), а не длинными формальными реквизитами акта; лимит "
+                "API — 255 символов. Фрагмент выдачи служит только для навигации и не "
+                "заменяет текст нормы. "
                 "После получения результатов используй get_ilex_sections, если номер нормы известен; "
                 "search_ilex_document — если номер неизвестен; crawl_authenticated — только когда "
                 "действительно нужен весь текст целиком."
@@ -1817,7 +2110,8 @@ async def list_tools() -> list[types.Tool]:
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "Поисковый запрос (например: 'статья 169 трудовой кодекс')"},
-                    "max_results": {"type": "integer", "description": "Максимум результатов (по умолчанию 10)", "default": 10}
+                    "max_results": {"type": "integer", "description": "Максимум результатов, не более 10 (по умолчанию 10)", "default": 10},
+                    "category": {"type": "string", "description": "Необязательная категория пользователя для поиска (например, 'lawyer' или 'accountant'); без неё используется категория по умолчанию"}
                 },
                 "required": ["query"]
             }
@@ -1830,18 +2124,15 @@ async def list_tools() -> list[types.Tool]:
                 "конкретный вопрос по документу — экономит контекст в 10-20 раз. "
                 "НЕ ИСПОЛЬЗУЙ этот инструмент, если номер статьи или пункта уже известен: в таком "
                 "случае обязательно вызывай get_ilex_sections, чтобы не возвращать лишние фрагменты. "
-                "Текст кешируется на диск; актуальность редакции проверяется автоматически при "
-                "каждом обращении. Не устанавливай bypass_cache=true без прямой просьбы пользователя "
-                "или подтверждённого повреждения кеша: это запускает дорогой повторный экспорт документа. "
-                "Внутри инструмент скачивает документ через кнопку «Экспорт в Word» на странице "
-                "ilex.by и конвертирует RTF в текст — это происходит на стороне сервера и не "
-                "требует от тебя никаких действий с файлами, но гарантирует полный текст документа "
-                "(а не обрезанный DOM, как при прямом чтении страницы у больших документов)."
+                "Полный текст документа сервер получает через официальное API ilex и кеширует "
+                "на диск; актуальность редакции проверяется автоматически через журнал "
+                "публикаций API. Не устанавливай bypass_cache=true без прямой просьбы пользователя "
+                "или подтверждённого повреждения кеша: это запускает повторную загрузку всего документа."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "url": {"type": "string", "description": "URL документа на ilex.by (view-document/...)"},
+                    "url": {"type": "string", "description": "URL документа ilex.by (view-document/BELAW/<номер>/) или краткая ссылка BELAW/<номер>"},
                     "query": {"type": "string", "description": "Поисковый запрос — что именно найти в документе"},
                     "max_results": {"type": "integer", "description": "Максимум фрагментов в ответе (по умолчанию 5)", "default": 5},
                     "max_chars": {"type": "integer", "description": "Мягкий лимит размера ответа в символах (по умолчанию 12000)", "default": 12000},
@@ -1863,7 +2154,7 @@ async def list_tools() -> list[types.Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "url": {"type": "string", "description": "URL документа ilex.by"},
+                    "url": {"type": "string", "description": "URL документа ilex.by (view-document/BELAW/<номер>/) или краткая ссылка BELAW/<номер>"},
                     "sections": {
                         "type": "array",
                         "items": {"type": "string"},
@@ -1879,16 +2170,17 @@ async def list_tools() -> list[types.Tool]:
             name="inspect_ilex_document",
             description=(
                 "Проверяет карточку первичного BELAW-документа перед правовым выводом: "
-                "возвращает заголовок, редакцию, дату вступления в силу и универсально ищет "
-                "связанные протоколы/изменяющие документы среди ранее полученных BELAW и "
-                "через поиск ILEX. Используй для каждого применимого документа в сложном "
+                "возвращает реквизиты из карточки API ilex (статус, вид редакции, дату "
+                "изменений, начало и окончание действия редакции, источник публикации, "
+                "справку к документу) и универсально ищет связанные протоколы/изменяющие "
+                "документы в справке, среди ранее полученных BELAW и через поиск ILEX. Используй для каждого применимого документа в сложном "
                 "или многодокументном вопросе. Найденные связанные документы необходимо "
                 "получить либо явно оценить через validate_legal_research."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "url": {"type": "string", "description": "URL первичного BELAW-документа"},
+                    "url": {"type": "string", "description": "URL первичного BELAW-документа или краткая ссылка BELAW/<номер>"},
                     "search_related": {
                         "type": "boolean",
                         "description": "Искать связанные акты через ILEX, если их нет в локальном индексе",
@@ -1966,16 +2258,16 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(
             name="crawl_authenticated",
             description=(
-                "Скрапит страницу через реальный Chrome headless, используя активную сессию пользователя. "
-                "Используй для ilex.by и других сайтов где требуется авторизация. "
-                "Chrome открываться не будет — работает в фоне. Для документов ilex.by автоматически "
-                "использует тот же механизм получения полного текста (экспорт в Word), что и "
-                "search_ilex_document, но без поиска фрагментов — возвращает весь текст целиком."
+                "Возвращает полный текст документа ilex.by целиком через официальное API "
+                "ilex вместе с реквизитами редакции. Используй только когда точечного "
+                "получения через get_ilex_sections или search_ilex_document объективно "
+                "недостаточно: у кодексов полный текст очень объёмный. Другие сайты не "
+                "поддерживаются — для них используй crawl."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "url": {"type": "string", "description": "URL страницы"}
+                    "url": {"type": "string", "description": "URL документа ilex.by (view-document/BELAW/<номер>/) или краткая ссылка BELAW/<номер>"}
                 },
                 "required": ["url"]
             }
@@ -2130,24 +2422,42 @@ async def do_search_crawl(arguments: dict) -> list[types.TextContent]:
 
 async def do_search_ilex(arguments: dict) -> list[types.TextContent]:
     query = arguments["query"]
-    max_results = arguments.get("max_results", 10)
+    max_results = arguments.get("max_results", ILEX_SEARCH_MAX_RESULTS)
+    category = arguments.get("category") or None
     try:
         with perf_stage("ilex_search_total"):
-            results = await search_ilex(query, max_results)
-    except Exception as e:
-        return [types.TextContent(type="text", text=f"Ошибка поиска: {e}")]
+            results = await search_ilex(query, max_results, category)
+    except IlexApiError as e:
+        message = f"Ошибка поиска: {e}"
+        if category and e.status_code == 400:
+            try:
+                categories = await ILEX_API.search_categories()
+                message += "\nДоступные категории: " + ", ".join(
+                    f"{item.get('code')} ({item.get('name')})" for item in categories
+                )
+            except IlexApiError:
+                pass
+        return [types.TextContent(type="text", text=message)]
     if not results:
         return [types.TextContent(type="text", text=f"По запросу «{query}» ничего не найдено на ilex.by")]
-    lines = [f"Найдено результатов: {len(results)}\n"]
+    lines = [f"Найдено документов: {len(results)}\n"]
     for i, r in enumerate(results, 1):
         lines.append(f"**{i}. {r['title']}**")
         lines.append(f"   {r['url']}")
-        if r.get("source"):
-            lines.append(f"   Источник результата: {r['source']}")
-        if r["snippet"]:
-            lines.append(f"   {r['snippet'][:200]}")
+        details = [f"ИБ: {r['infobank']}"] if r.get("infobank") else []
+        if r.get("status"):
+            details.append(f"Статус: {r['status']}")
+        if details:
+            lines.append("   " + " · ".join(details))
+        if r.get("snippet"):
+            segment = f"сегмент {r['segment_id']}" if r.get("segment_id") else "фрагмент"
+            lines.append(f"   Релевантный {segment} (только для навигации): {r['snippet']}")
         lines.append("")
     return [types.TextContent(type="text", text="\n".join(lines))]
+
+
+def _ilex_revision_checked(status: str) -> bool:
+    return status in {"cached", "downloaded", "updated", "refreshed"}
 
 
 async def do_search_ilex_document(arguments: dict) -> list[types.TextContent]:
@@ -2156,19 +2466,17 @@ async def do_search_ilex_document(arguments: dict) -> list[types.TextContent]:
     max_results = arguments.get("max_results", MAX_FRAGMENTS)
     max_chars = arguments.get("max_chars", MAX_RESPONSE_CHARS)
     bypass_cache = arguments.get("bypass_cache", False)
-    pages, status = await fetch_ilex_pages(url, bypass_cache)
-    if isinstance(pages, str):
-        return [types.TextContent(type="text", text=pages)]
-    note = ilex_cache_status_note(status)
+    document, status = await fetch_ilex_document(url, bypass_cache)
+    if isinstance(document, str):
+        return [types.TextContent(type="text", text=document)]
+    note = ilex_cache_status_note(status) + ilex_document_brief(document)
     with perf_stage("document_search"):
         result = search_with_structural_preference(
-            pages, query, max_results=max_results, max_chars=max_chars
+            [document["text"]], query, max_results=max_results, max_chars=max_chars
         )
     evidence = _research_evidence(url)
     evidence["document_searched"] = True
-    evidence["revision_checked"] = status in {
-        "cached", "downloaded", "updated", "refreshed"
-    }
+    evidence["revision_checked"] = _ilex_revision_checked(status)
     locators = explicit_locators_from_query(query)
     if locators:
         record_exact_ilex_sections(url, locators, result, status)
@@ -2180,12 +2488,15 @@ async def do_get_ilex_sections(arguments: dict) -> list[types.TextContent]:
     sections = arguments["sections"]
     max_chars = arguments.get("max_chars", MAX_RESPONSE_CHARS)
     bypass_cache = arguments.get("bypass_cache", False)
-    pages, status = await fetch_ilex_pages(url, bypass_cache)
-    if isinstance(pages, str):
-        return [types.TextContent(type="text", text=pages)]
-    note = ilex_cache_status_note(status)
+    document, status = await fetch_ilex_document(url, bypass_cache)
+    if isinstance(document, str):
+        return [types.TextContent(type="text", text=document)]
+    note = ilex_cache_status_note(status) + ilex_document_brief(document)
+    pages = [document["text"]]
     with perf_stage("section_index_read_and_extract"):
-        index = cached_structural_index(url_to_ilex_cache_path(url), pages)
+        index = document.get("structure_index")
+        if not index or index.get("version") != STRUCTURE_INDEX_VERSION:
+            index = cached_structural_index(url_to_ilex_cache_path(url), pages)
         result = extract_structured_sections(
             pages, sections, max_chars=max_chars, structure_index=index
         )
@@ -2193,58 +2504,90 @@ async def do_get_ilex_sections(arguments: dict) -> list[types.TextContent]:
     return [types.TextContent(type="text", text=note + result)]
 
 
+ILEX_NOTE_HEAD_CHARS = 1500
+ILEX_NOTE_TAIL_CHARS = 2500
+
+
+def compact_ilex_note(note: str) -> str:
+    """
+    Справка к кодексу перечисляет все изменяющие акты и бывает очень длинной.
+    Последний изменяющий акт обычно в конце, поэтому сохраняется и начало, и конец.
+    """
+    note = note.strip()
+    limit = ILEX_NOTE_HEAD_CHARS + ILEX_NOTE_TAIL_CHARS
+    if len(note) <= limit:
+        return note
+    omitted = len(note) - limit
+    return (
+        note[:ILEX_NOTE_HEAD_CHARS].rstrip()
+        + f"\n[… пропущено {omitted} символов справки …]\n"
+        + note[-ILEX_NOTE_TAIL_CHARS:].lstrip()
+    )
+
+
+def _ilex_note_context(note: str, ref: tuple[str, int]) -> str:
+    marker = f"[{ref[0]}/{ref[1]}]"
+    for line in note.splitlines():
+        if marker in line:
+            line = re.sub(r"\s+", " ", line).strip()
+            return line[:300] + ("…" if len(line) > 300 else "")
+    return marker
+
+
 async def do_inspect_ilex_document(arguments: dict) -> list[types.TextContent]:
     url = arguments["url"]
     search_related = arguments.get("search_related", True)
     canonical_url = canonical_ilex_document_url(url)
     existing_evidence = _fresh_evidence(canonical_url)
-    cache_path = url_to_ilex_cache_path(url)
-    if (
-        existing_evidence
-        and existing_evidence["revision_checked"]
-        and cache_path.exists()
-    ):
-        try:
-            cached_data = json.loads(cache_path.read_text(encoding="utf-8"))
-            pages, status = [cached_data["text"]], "cached"
-        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
-            pages, status = await fetch_ilex_pages(url, False)
-    else:
-        pages, status = await fetch_ilex_pages(url, False)
-    if isinstance(pages, str):
-        return [types.TextContent(type="text", text=pages)]
+    document = None
+    status = "cached"
+    if existing_evidence and existing_evidence["revision_checked"]:
+        # Редакция уже проверена в этом исследовании — повторная сверка не нужна.
+        document = read_ilex_document_cache(url_to_ilex_cache_path(url))
+    if document is None:
+        document, status = await fetch_ilex_document(url, False)
+    if isinstance(document, str):
+        return [types.TextContent(type="text", text=document)]
 
-    text = "\n\n".join(pages)
-    revision = None
-    try:
-        cache_data = json.loads(
-            url_to_ilex_cache_path(url).read_text(encoding="utf-8")
-        )
-        revision = cache_data.get("revision")
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
-        pass
+    text = document["text"]
+    properties = document.get("properties") or {}
+    metadata = ilex_document_metadata(text, properties=properties)
+    heading_text = ilex_heading_source(document)
+    current_ref = parse_ilex_document_ref(canonical_url)
 
-    metadata = ilex_document_metadata(text, revision)
-    candidates = (
-        discover_related_cached_ilex_documents(url, text)
-        if metadata["requires_related_review"] else []
-    )
+    candidates = []
+    linked_documents = [
+        ref for ref in metadata["linked_documents"] if ref != current_ref
+    ]
+    if metadata["requires_related_review"]:
+        # Справка к международному договору ссылается на протоколы и
+        # изменяющие акты напрямую — это точнее текстового сходства.
+        for ref in linked_documents:
+            if ref[0] != "BELAW":
+                continue
+            candidates.append({
+                "url": ilex_document_url(*ref),
+                "title": _ilex_note_context(properties.get("note", ""), ref),
+                "score": 1.0,
+                "source": "ссылка в справке к документу",
+            })
+        candidates.extend(discover_related_cached_ilex_documents(url, heading_text))
     search_error = None
     live_search_performed = False
     if search_related and metadata["requires_related_review"] and not candidates:
         live_search_performed = True
         try:
-            results = await search_ilex(related_search_query(text), 10)
+            results = await search_ilex(related_search_query(heading_text), 10)
             for result in results:
                 candidate_url = canonical_ilex_document_url(result.get("url", ""))
                 candidate_title = result.get("title", "")
                 if (
                     "/BELAW/" not in candidate_url
-                    or candidate_url == canonical_ilex_document_url(url)
+                    or candidate_url == canonical_url
                     or not _RELATION_MARKER_RE.search(candidate_title)
                 ):
                     continue
-                score = related_document_score(text, candidate_title)
+                score = related_document_score(heading_text, candidate_title)
                 if score < 0.35:
                     continue
                 candidates.append({
@@ -2253,7 +2596,7 @@ async def do_inspect_ilex_document(arguments: dict) -> list[types.TextContent]:
                     "score": round(score, 3),
                     "source": "поиск связанных первичных документов ILEX",
                 })
-        except Exception as exc:
+        except IlexApiError as exc:
             search_error = str(exc)
 
     unique_candidates = {}
@@ -2264,9 +2607,7 @@ async def do_inspect_ilex_document(arguments: dict) -> list[types.TextContent]:
     candidates = list(unique_candidates.values())
 
     evidence = _research_evidence(url)
-    evidence["revision_checked"] = status in {
-        "cached", "downloaded", "updated", "refreshed"
-    }
+    evidence["revision_checked"] = _ilex_revision_checked(status)
     evidence["related_inspected"] = bool(
         not metadata["requires_related_review"]
         or candidates
@@ -2275,13 +2616,38 @@ async def do_inspect_ilex_document(arguments: dict) -> list[types.TextContent]:
     evidence["related_candidates"] = candidates
     evidence["document_title"] = metadata["title"]
 
+    _, status_label = ilex_property_code(properties.get("status"), ILEX_STATUS_LABELS)
+    _, edition_label = ilex_property_code(properties.get("edition"), ILEX_EDITION_LABELS)
+    _, info_type_label = ilex_property_code(properties.get("infoType"), ILEX_INFO_TYPE_LABELS)
     lines = [
         ilex_cache_status_note(status).strip(),
         f"Документ: {metadata['title'] or '(заголовок не распознан)'}",
-        f"URL: {canonical_ilex_document_url(url)}",
-        f"Редакция в заголовке ILEX: {metadata['revision'] or 'не указана'}",
-        f"Вступление в силу: {metadata['entry_into_force'] or 'не найдено в заголовочной части'}",
+        f"URL: {canonical_url}",
     ]
+    card_fields = [
+        ("Вид документа", properties.get("kinds")),
+        ("Тип информации", info_type_label),
+        ("Принявший орган", ilex_authorities_label(properties.get("acceptedAuthorities", ""))),
+        ("Дата принятия", properties.get("dates")),
+        ("Статус", status_label),
+        ("Редакция", edition_label),
+        ("Дата последних изменений (редакция от)", metadata["revision"]),
+        ("Начало действия редакции", properties.get("takeEffectDate")),
+        ("Окончание действия редакции", properties.get("terminateEffectDate")),
+        ("Вступление документа в силу", metadata["entry_into_force"]),
+        ("Источник публикации", properties.get("sourcePublication")),
+    ]
+    lines.extend(f"{label}: {value}" for label, value in card_fields if value)
+    warnings = ilex_document_warnings(properties)
+    if document.get("amendment_notes_missing"):
+        warnings.append(AMENDMENT_NOTES_WARNING)
+    warnings.append(EDITORIAL_NOTES_WARNING)
+    if warnings:
+        lines.append("")
+        lines.extend(warnings)
+    if properties.get("note"):
+        lines.append("\nСправка к документу:")
+        lines.append(compact_ilex_note(properties["note"]))
     if metadata["future_change_markers"]:
         lines.append("\nОбнаружены маркеры будущих изменений; проверь их применимость:")
         lines.extend(f"- {marker}" for marker in metadata["future_change_markers"])
@@ -2301,14 +2667,19 @@ async def do_inspect_ilex_document(arguments: dict) -> list[types.TextContent]:
         )
     elif metadata["requires_related_review"] and not search_related:
         lines.append(
-            "\n⚠️ Проверка связанных документов ограничена локальным индексом "
-            "и не завершена. Повтори вызов с search_related=true."
+            "\n⚠️ Проверка связанных документов ограничена справкой и локальным "
+            "индексом и не завершена. Повтори вызов с search_related=true."
         )
     elif metadata["requires_related_review"]:
-        source = "локальный индекс и поиск ILEX" if live_search_performed else "локальный индекс"
+        source = "справка, локальный индекс и поиск ILEX" if live_search_performed else "справка и локальный индекс"
         lines.append(f"\nСвязанные документы не обнаружены ({source}).")
     else:
         lines.append("\nОтдельная проверка связанных актов для этого вида документа не требуется.")
+        if linked_documents:
+            lines.append(
+                "Документы, упомянутые в справке: "
+                + ", ".join(ilex_document_url(*ref) for ref in linked_documents[:20])
+            )
     return [types.TextContent(type="text", text="\n".join(line for line in lines if line))]
 
 
@@ -2337,14 +2708,20 @@ async def do_validate_legal_research(arguments: dict) -> list[types.TextContent]
 
 async def do_crawl_authenticated(arguments: dict) -> list[types.TextContent]:
     url = arguments["url"]
-    try:
-        text = await fetch_authenticated_page(url)
-        if is_ilex_url(url):
-            evidence = _research_evidence(url)
-            evidence["full_text_loaded"] = True
-        return [types.TextContent(type="text", text=text or "(пустая страница)")]
-    except Exception as e:
-        return [types.TextContent(type="text", text=f"Ошибка: {e}")]
+    if parse_ilex_document_ref(url) is None:
+        return [types.TextContent(type="text", text=(
+            "crawl_authenticated работает только с документами ilex.by "
+            "(view-document/<ИБ>/<номер>/ или <ИБ>/<номер>). Для других сайтов "
+            "используй crawl."
+        ))]
+    document, status = await fetch_ilex_document(url)
+    if isinstance(document, str):
+        return [types.TextContent(type="text", text=document)]
+    evidence = _research_evidence(url)
+    evidence["full_text_loaded"] = True
+    evidence["revision_checked"] = _ilex_revision_checked(status)
+    note = ilex_cache_status_note(status) + ilex_document_brief(document)
+    return [types.TextContent(type="text", text=note + document["text"])]
 
 
 async def do_download_pdf(arguments: dict) -> list[types.TextContent]:
@@ -2402,7 +2779,7 @@ async def main():
                 server.create_initialization_options(),
             )
     finally:
-        await ILEX_BROWSER.close()
+        await ILEX_API.close()
 
 if __name__ == "__main__":
     asyncio.run(main())

@@ -288,13 +288,13 @@ class LegalResearchCompletenessTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir, patch(
             "server.ILEX_CACHE_DIR", Path(temp_dir)
         ), patch(
-            "server.fetch_ilex_pages", new_callable=AsyncMock
+            "server.fetch_ilex_document", new_callable=AsyncMock
         ) as fetch:
             cache_path = server.url_to_ilex_cache_path(AGREEMENT_URL)
             cache_path.write_text(json.dumps({
                 "url": AGREEMENT_URL,
                 "text": AGREEMENT_TEXT,
-                "revision": None,
+                "properties": {},
             }, ensure_ascii=False), encoding="utf-8")
 
             result = asyncio.run(server.do_inspect_ilex_document({

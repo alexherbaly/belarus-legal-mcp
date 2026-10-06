@@ -10,6 +10,7 @@ import re
 import time
 import uuid
 from bisect import bisect_right
+from collections import deque
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -38,7 +39,9 @@ ILEX_SEARCH_CACHE_DIR = (
     Path.home() / ".claude" / "mcp_servers" / "ilex_search_cache"
 )
 ILEX_SEARCH_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-ILEX_SEARCH_CACHE_TTL_SECONDS = 60 * 60
+# Выдача меняется редко, а каждый запрос к API расходует лимит тестового
+# доступа (1000 запросов), поэтому выдача живёт сутки.
+ILEX_SEARCH_CACHE_TTL_SECONDS = 24 * 60 * 60
 
 PERF_LOG_PATH = (
     Path.home() / ".claude" / "mcp_servers" / "logs" / "belarus_legal_mcp.jsonl"
@@ -705,9 +708,9 @@ ILEX_SEARCH_MAX_RESULTS = 10
 # Ключ поисковой выдачи версионируется, чтобы не подхватить из кеша результаты,
 # полученные ещё скрапингом страницы через Chrome.
 ILEX_SEARCH_CACHE_KEY_PREFIX = "api-v1"
-# Повторная проверка через documents/history нужна не чаще, чем раз в несколько
-# минут: в одном исследовании модель обращается к одному документу много раз.
-ILEX_REVISION_CHECK_INTERVAL_SECONDS = 10 * 60
+# Повторная проверка через documents/history — раз в 6 часов: модель обращается
+# к одному документу много раз, а тестовый доступ к API ограничен 1000 запросов.
+ILEX_REVISION_CHECK_INTERVAL_SECONDS = 6 * 60 * 60
 ILEX_DOCUMENT_CACHE_VERSION = 4
 # Максимальная разница дат from/to, которую принимает documents/history
 # (строго меньше 7 дней), минус запас на смену суток.
@@ -722,14 +725,48 @@ ILEX_API_ATTEMPTS = 3
 ILEX_API_RETRY_DELAY_SECONDS = 2.0
 ILEX_API_MAX_RETRY_DELAY_SECONDS = 10.0
 ILEX_API_RETRY_STATUSES = {429, 502, 503, 504, 509}
+ILEX_API_RATE_LIMIT_STATUSES = {429, 509}
+# ilex ограничивает API 15–20 запросами в минуту (дальше — HTTP 509).
+# Claude Desktop запускает несколько процессов сервера, у каждого свой счётчик,
+# поэтому лимит одного процесса взят с запасом.
+ILEX_API_MAX_REQUESTS_PER_MINUTE = 12
+ILEX_API_RATE_LIMIT_RETRY_SECONDS = 20.0
 
 
 def _ilex_retry_delay(response, attempt: int) -> float:
     try:
-        delay = float(response.headers.get("Retry-After", ""))
+        return max(0.0, float(response.headers.get("Retry-After", "")))
     except ValueError:
-        delay = ILEX_API_RETRY_DELAY_SECONDS * (attempt + 1)
+        pass
+    if response.status_code in ILEX_API_RATE_LIMIT_STATUSES:
+        # Окно лимита — минута: короткая пауза только сожгла бы попытку.
+        return ILEX_API_RATE_LIMIT_RETRY_SECONDS * (attempt + 1)
+    delay = ILEX_API_RETRY_DELAY_SECONDS * (attempt + 1)
     return max(0.0, min(delay, ILEX_API_MAX_RETRY_DELAY_SECONDS))
+
+
+class SlidingWindowRateLimiter:
+    """Не пускает больше limit запросов за window секунд, заставляя ждать."""
+
+    def __init__(self, limit: int, window: float = 60.0, clock=time.monotonic) -> None:
+        self._limit = limit
+        self._window = window
+        self._clock = clock
+        self._sent: deque[float] = deque()
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> None:
+        async with self._lock:
+            while True:
+                now = self._clock()
+                while self._sent and now - self._sent[0] >= self._window:
+                    self._sent.popleft()
+                if len(self._sent) < self._limit:
+                    self._sent.append(now)
+                    return
+                wait = self._window - (now - self._sent[0])
+                log_perf("ilex_api_throttled", wait_ms=round(wait * 1000))
+                await asyncio.sleep(wait)
 
 
 class IlexApiError(Exception):
@@ -827,6 +864,7 @@ class IlexApiClient:
         self._client = None
         self._token: str | None = None
         self._auth_lock = asyncio.Lock()
+        self._rate_limiter = SlidingWindowRateLimiter(ILEX_API_MAX_REQUESTS_PER_MINUTE)
 
     def _http(self):
         if self._client is None:
@@ -849,6 +887,7 @@ class IlexApiClient:
         for attempt in range(ILEX_API_ATTEMPTS):
             last_attempt = attempt == ILEX_API_ATTEMPTS - 1
             try:
+                await self._rate_limiter.acquire()
                 response = await self._http().request(method, path, **kwargs)
             except httpx.TransportError as exc:
                 if last_attempt:
@@ -1676,8 +1715,8 @@ def _ilex_segment_items(raw) -> list[tuple[str, str]]:
     if isinstance(raw, dict):
         raw = [raw]
     items = []
-    # Ключ бывает составным: «104267##104247,100001» — собственный номер
-    # сегмента идёт до «##», дальше номера связанных сегментов.
+    # Ключ бывает составным: «104267##104247,100001» — основная метка сегмента
+    # идёт до «##», дальше исторические метки (так размечает ilex).
     for entry in raw or []:
         if isinstance(entry, dict):
             if "text" in entry and ("id" in entry or "segmentId" in entry):

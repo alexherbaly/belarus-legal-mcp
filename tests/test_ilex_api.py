@@ -417,6 +417,38 @@ class ApiClientTests(IlexApiTestCase):
         )
 
 
+class RateLimiterTests(unittest.TestCase):
+    def test_waits_for_window_instead_of_exceeding_limit(self):
+        now = [0.0]
+        slept = []
+
+        async def fake_sleep(seconds):
+            slept.append(seconds)
+            now[0] += seconds
+
+        limiter = server.SlidingWindowRateLimiter(2, window=60.0, clock=lambda: now[0])
+
+        async def run():
+            with patch("server.asyncio.sleep", new=fake_sleep):
+                for _ in range(3):
+                    await limiter.acquire()
+                    now[0] += 1.0
+
+        asyncio.run(run())
+
+        self.assertEqual(slept, [58.0])
+
+    def test_rate_limit_retry_waits_for_next_window(self):
+        response = httpx.Response(509)
+
+        self.assertEqual(server._ilex_retry_delay(response, 0), 20.0)
+        self.assertEqual(
+            server._ilex_retry_delay(httpx.Response(509, headers={"Retry-After": "5"}), 0),
+            5.0,
+        )
+        self.assertEqual(server._ilex_retry_delay(httpx.Response(503), 0), 2.0)
+
+
 class DocumentCacheTests(IlexApiTestCase):
     URL = "https://ilex-private.ilex.by/view-document/BELAW/184728/"
 

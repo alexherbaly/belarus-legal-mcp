@@ -85,6 +85,7 @@ class FakeIlexApi:
         self.history = {"BELAW": []}
         self.history_status = 200
         self.rate_limited_requests = 0
+        self.guard_blocks_search = False
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path.removeprefix("/backend-client/api/v1")
@@ -102,12 +103,23 @@ class FakeIlexApi:
             return httpx.Response(200, json={"token": token})
         if request.headers.get("x-auth-token") not in self.valid_tokens:
             return httpx.Response(401)
+        if path == "/search/documents" and self.guard_blocks_search:
+            return httpx.Response(405, headers={"content-type": "text/html"}, text=(
+                "<html><head><title>405 Not Allowed</title></head><body><center>"
+                "<h1>405 Not Allowed</h1></center><hr><center>nginx</center></body></html>"
+            ))
         if path == "/search/documents":
             return httpx.Response(200, json=SEARCH_RESPONSE)
         if path == "/documents/history":
             return httpx.Response(self.history_status, json=self.history)
         if path == "/documents/BELAW/184728":
             return httpx.Response(200, json=self.document)
+        if path == "/documents/BELAW/777":
+            return httpx.Response(200, headers={"content-type": "text/html"}, text=(
+                "<!DOCTYPE html><html><head><title>403 Forbidden</title></head><body>"
+                "<h1>403 Forbidden</h1><p>Access to this resource blocked by guard "
+                "service.</p></body></html>"
+            ))
         if path == "/documents/BELAW/403":
             return httpx.Response(403, json={"message": "Нет доступа по фиче"})
         return httpx.Response(404)
@@ -399,6 +411,23 @@ class ApiClientTests(IlexApiTestCase):
             asyncio.run(self.api.search_documents("статья 42"))
 
         self.assertIn("лимит частоты", str(error.exception))
+
+    def test_reports_guard_block_on_get_with_status_200(self):
+        document, status = asyncio.run(server.fetch_ilex_document("BELAW/777"))
+
+        self.assertEqual(status, "error")
+        self.assertIn("заблокирован защитным фильтром ilex", document)
+        self.assertIn("blocked by guard service", document)
+        self.assertNotIn("<html", document.lower())
+
+    def test_reports_guard_block_on_post_as_nginx_405(self):
+        self.fake.guard_blocks_search = True
+
+        with self.assertRaises(server.IlexApiError) as error:
+            asyncio.run(self.api.search_documents("статья 42"))
+
+        self.assertIn("заблокирован защитным фильтром ilex", str(error.exception))
+        self.assertIn("405 Not Allowed", str(error.exception))
 
     def test_rejects_too_long_search_query_before_request(self):
         with self.assertRaises(server.IlexApiError):

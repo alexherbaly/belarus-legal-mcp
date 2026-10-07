@@ -811,10 +811,47 @@ def ilex_credentials() -> tuple[str, str]:
     return username, password
 
 
+_ILEX_GUARD_MARKER = "blocked by guard service"
+
+
+def _html_text(markup: str) -> str:
+    """Короткий текст HTML-страницы ошибки: заголовок и абзацы без разметки."""
+    text = re.sub(r"(?is)<(script|style)\b.*?</\1>", " ", markup)
+    text = html.unescape(re.sub(r"<[^>]+>", " ", text))
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def ilex_guard_blocked(response) -> bool:
+    """
+    Перед API стоит защитный фильтр nginx. Заблокированный запрос он отдаёт
+    HTML-страницей «Access to this resource blocked by guard service» (на GET
+    даже с кодом 200), а на POST — страницей nginx «405 Not Allowed».
+    """
+    content_type = response.headers.get("content-type", "")
+    if "html" not in content_type:
+        return False
+    body = response.text
+    return _ILEX_GUARD_MARKER in body.lower() or (
+        response.status_code == 405 and "nginx" in body.lower()
+    )
+
+
+def ilex_guard_error(response, action: str) -> IlexApiError:
+    return IlexApiError(
+        f"API ilex: {action} — запрос заблокирован защитным фильтром ilex "
+        f"(HTTP {response.status_code}: «{_html_text(response.text)[:160]}»), "
+        "а не отклонён самим API. Повторный запрос не поможет: блокировку "
+        "снимает поддержка ilex.",
+        response.status_code,
+    )
+
+
 def _ilex_error_detail(response) -> str:
     try:
         data = response.json()
     except ValueError:
+        if "html" in response.headers.get("content-type", ""):
+            return _html_text(response.text)[:300]
         return response.text.strip()[:300]
     if isinstance(data, dict):
         for key in ("message", "error", "detail", "title"):
@@ -824,6 +861,8 @@ def _ilex_error_detail(response) -> str:
 
 
 def ilex_api_error(response, action: str) -> IlexApiError:
+    if ilex_guard_blocked(response):
+        return ilex_guard_error(response, action)
     status = response.status_code
     if status == 400:
         reason = "некорректный запрос"
@@ -855,8 +894,8 @@ def ilex_api_error(response, action: str) -> IlexApiError:
 class IlexApiClient:
     """
     Клиент официального API ilex (backend-client). Токен получается лениво при
-    первом обращении и обновляется один раз при ответе 401 — срок жизни токена
-    API не документирован.
+    первом обращении и обновляется один раз при ответе 401: по словам ilex, он
+    истекает через 8 часов после последнего запроса.
     """
 
     def __init__(self, base_url: str = ILEX_API_BASE_URL) -> None:
@@ -934,13 +973,14 @@ class IlexApiClient:
             response = await self._send(
                 method, path, headers={"x-auth-token": token}, **kwargs
             )
-        if response.status_code != 200:
+        if response.status_code != 200 or ilex_guard_blocked(response):
             raise ilex_api_error(response, action)
         try:
             return response.json()
         except ValueError as exc:
             raise IlexApiError(
-                f"API ilex: {action} — ответ не является JSON."
+                f"API ilex: {action} — ответ не является JSON: "
+                f"«{_ilex_error_detail(response)[:160]}»."
             ) from exc
 
     async def search_documents(self, query: str, category: str | None = None) -> dict:

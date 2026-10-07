@@ -97,6 +97,11 @@ ILEX_PASSWORD=пароль
 `https://ilex-private.ilex.by/backend-client/api/v1`; при необходимости его
 можно переопределить переменной `ILEX_API_BASE_URL`.
 
+Запросы к API отправляются с заголовком `User-Agent: ilex-api-client/1.0`, как
+рекомендует ilex: со стандартным User-Agent HTTP-библиотеки защитный фильтр
+перед API блокирует запросы («Access to this resource blocked by guard
+service»). Значение можно переопределить переменной `ILEX_API_USER_AGENT`.
+
 Команды `pip install .` нужно выполнять из папки этого проекта. Для проверки
 изменений запустите:
 

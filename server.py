@@ -703,6 +703,10 @@ ILEX_API_BASE_URL = os.environ.get(
     "ILEX_API_BASE_URL", f"{ILEX_WEB_BASE_URL}/backend-client/api/v1"
 ).rstrip("/")
 ILEX_API_TIMEOUT_SECONDS = 90
+# Защитный фильтр перед API блокирует запросы со стандартным User-Agent
+# HTTP-библиотеки («Access to this resource blocked by guard service»);
+# ilex рекомендует передавать собственный User-Agent клиента API.
+ILEX_API_USER_AGENT = os.environ.get("ILEX_API_USER_AGENT", "ilex-api-client/1.0")
 ILEX_SEARCH_MAX_QUERY_CHARS = 255
 ILEX_SEARCH_MAX_RESULTS = 10
 # Ключ поисковой выдачи версионируется, чтобы не подхватить из кеша результаты,
@@ -840,8 +844,9 @@ def ilex_guard_error(response, action: str) -> IlexApiError:
     return IlexApiError(
         f"API ilex: {action} — запрос заблокирован защитным фильтром ilex "
         f"(HTTP {response.status_code}: «{_html_text(response.text)[:160]}»), "
-        "а не отклонён самим API. Повторный запрос не поможет: блокировку "
-        "снимает поддержка ilex.",
+        "а не отклонён самим API. Повторный запрос не поможет: проверьте "
+        f"заголовок User-Agent (сейчас «{ILEX_API_USER_AGENT}») или обратитесь "
+        "в поддержку ilex.",
         response.status_code,
     )
 
@@ -912,7 +917,10 @@ class IlexApiClient:
             self._client = httpx.AsyncClient(
                 base_url=self._base_url,
                 timeout=ILEX_API_TIMEOUT_SECONDS,
-                headers={"Accept": "application/json"},
+                headers={
+                    "Accept": "application/json",
+                    "User-Agent": ILEX_API_USER_AGENT,
+                },
             )
         return self._client
 

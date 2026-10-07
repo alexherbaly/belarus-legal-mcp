@@ -364,6 +364,24 @@ class DocumentParsingTests(unittest.TestCase):
 
 
 class ApiClientTests(IlexApiTestCase):
+    def test_sends_ilex_api_client_user_agent(self):
+        seen = []
+        api = server.IlexApiClient("https://ilex.test/backend-client/api/v1")
+        transport = httpx.MockTransport(
+            lambda request: (seen.append(request.headers.get("user-agent")),
+                             httpx.Response(200, json={"token": "t"}))[1]
+        )
+        original = httpx.AsyncClient
+
+        def client_with_transport(**kwargs):
+            return original(transport=transport, **kwargs)
+
+        with patch("httpx.AsyncClient", side_effect=client_with_transport):
+            asyncio.run(api._authenticate(None))
+            asyncio.run(api.close())
+
+        self.assertEqual(seen, ["ilex-api-client/1.0"])
+
     def test_authenticates_once_and_reuses_token(self):
         asyncio.run(self.api.search_documents("статья 42"))
         asyncio.run(self.api.search_documents("статья 43"))
